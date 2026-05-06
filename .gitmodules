@@ -1,0 +1,3 @@
+[submodule "3dsg/HumanSSG"]
+	path = 3dsg/HumanSSG
+	url = https://github.com/leohmcs/HumanSSG.git

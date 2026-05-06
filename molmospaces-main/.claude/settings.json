@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./.venv/bin/python3 experiments/social_nav/social_cost_net.py --train --n-scenes 5000 --epochs 40 --save checkpoints/scf_rule.pt)",
+      "Bash(./.venv/bin/python3 experiments/social_nav/social_cost_field.py --train --n-scenes 5000 --epochs 40 --save checkpoints/scf2.pt)",
+      "Bash(./.venv/bin/pip3 install:*)",
+      "Bash(./.venv/bin/python3 -m pip install sentence-transformers -q)",
+      "Bash(./.venv/bin/uv pip:*)",
+      "Bash(uv pip:*)",
+      "Bash(./.venv/bin/python3 experiments/social_nav/social_cost_field.py --train --n-scenes 5000 --epochs 40 --save checkpoints/scf2_text.pt)",
+      "Bash(./.venv/bin/python3 -c ':*)",
+      "Bash(./.venv/bin/python3 -u experiments/social_nav/social_cost_field.py --train --n-scenes 5000 --epochs 40 --save checkpoints/scf2_text.pt)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(list\\(d.keys\\(\\)\\)\\)\")",
+      "Read(//Users/ljj/project/graduation/**)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2, ensure_ascii=False\\)[:2000]\\)\")",
+      "Bash(python3 -c ':*)",
+      "Read(//Users/ljj/**)",
+      "Bash(.venv/bin/python3 -c ':*)",
+      "Bash(.venv/bin/python3 experiments/social_nav/social_cost_field.py --label-archetypes)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -)",
+      "Bash(awk '{print $3, $4, $11}')"
+    ]
+  }
+}
