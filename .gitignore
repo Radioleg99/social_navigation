@@ -1,0 +1,71 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Jupyter / IPython ────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE / editors ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ── Model checkpoints & large binary assets ──────────────────────────────────
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pkl.gz
+*.bin
+*.h5
+*.onnx
+
+# ── Data & outputs ───────────────────────────────────────────────────────────
+data/
+data_3dgs/
+outputs/
+ai_test_results/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+
+# ── Mapping / SLAM outputs ───────────────────────────────────────────────────
+3dsg/HumanSSG/conceptgraph/slam/outputs/
+3dsg/HumanSSG/conceptgraph/slam/humanssg/outputs/
+mapping_process.log
+
+# ── Secrets / env ────────────────────────────────────────────────────────────
+.env
+*.env
+.env.local
+
+# ── Conda installer ──────────────────────────────────────────────────────────
+Miniconda3-*.sh
+*.fbx
+
+# ── MuJoCo compiled assets ───────────────────────────────────────────────────
+*.so
+*.dylib
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
