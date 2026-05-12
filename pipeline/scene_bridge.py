@@ -42,7 +42,8 @@ import numpy as np
 class HumanInfo(NamedTuple):
     pos: tuple[float, float]    # (x, y) in MuJoCo world frame (metres)
     yaw_deg: float              # heading, 0=+x, 90=+y
-    state: str                  # "idle" | "talking" | "sitting" | "walking"
+    activities: list[str]       # raw activity names from scene graph, e.g. ["SPEAK", "OBSERVE"]
+    state: str                  # idle | sitting | walking | talking
 
 
 class ObstacleInfo(NamedTuple):
@@ -56,26 +57,6 @@ class SceneDescription(NamedTuple):
     groups: list[list[int]]     # conversation groups: [[human_idx, ...], ...]
 
 
-# ---------------------------------------------------------------------------
-# Activity → social state mapping
-# HumanSSG activities: Sitting, Walking, Watching, Waiting, Preparing, Using,
-#                      Reading, Talking, Standing, ...
-# Social states:       sitting, walking, talking, idle
-# ---------------------------------------------------------------------------
-
-_ACTIVITY_TO_STATE: dict[str, str] = {
-    "talking":   "talking",
-    "sitting":   "sitting",
-    "walking":   "walking",
-    "standing":  "idle",
-    "watching":  "sitting",   # seated in front of TV / screen
-    "reading":   "sitting",
-    "using":     "sitting",
-    "waiting":   "idle",
-    "preparing": "idle",
-    "idle":      "idle",
-}
-
 # Obstacle categories that affect navigation (superset of llm_costmap list)
 _OBSTACLE_CLASSES = {
     "chair", "sofa", "armchair", "ottoman", "couch",
@@ -87,9 +68,15 @@ _OBSTACLE_CLASSES = {
 
 # Edge relations that indicate a conversation group
 _CONVERSATION_RELATIONS = {
-    "talking_to", "talking with", "conversing", "conversation",
-    "casual_chat", "chatting", "interacting_with",
+    "speak", "talking_to", "talking with", "conversing", "conversation",
+    "casual_chat", "chatting", "interacting_with", "talk", "chat",
 }
+
+_ACTIVITY_TO_STATE: list[tuple[set[str], str]] = [
+    ({"SPEAK", "TALK", "TALKING", "CONVERSATION", "CHAT", "OBSERVE", "GESTURE"}, "talking"),
+    ({"SIT", "SITTING", "SEATED"}, "sitting"),
+    ({"WALK", "WALKING", "RUN", "RUNNING"}, "walking"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +99,19 @@ def _apply_transform(
     p = np.array([xyz[0], xyz[1], xyz[2], 1.0], dtype=np.float64)
     p_out = transform @ p
     return float(p_out[0]), float(p_out[1])
+
+
+def _infer_human_state(activities: list[str], node: dict) -> str:
+    """Map raw HumanSSG activity tags/captions to the small runtime state set."""
+    explicit = str(node.get("state", "") or node.get("activity", "")).upper()
+    tags = set(activities)
+    if explicit:
+        tags.add(explicit)
+    caption = str(node.get("object_caption", "") or node.get("caption", "")).upper()
+    for keys, state in _ACTIVITY_TO_STATE:
+        if keys & tags or any(key in caption for key in keys):
+            return state
+    return "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +177,12 @@ def scene_graph_to_scene_description(
         # Heading: use stored value if available, otherwise 0
         yaw_deg = float(node.get("heading_deg", 0.0))
 
-        # Determine state from activities list
-        activities: list[dict] = node.get("activities", [])
-        state = _infer_state(activities)
+        raw_activities: list[dict] = node.get("activities", [])
+        activities = [act.get("name", "").upper() for act in raw_activities if act.get("name")]
+        state = _infer_human_state(activities, node)
 
         idx = len(humans)
-        humans.append(HumanInfo(pos=(x, y), yaw_deg=yaw_deg, state=state))
+        humans.append(HumanInfo(pos=(x, y), yaw_deg=yaw_deg, activities=activities, state=state))
         node_id_to_human_idx[nid] = idx
 
     # ------------------------------------------------------------------
@@ -207,24 +207,6 @@ def scene_graph_to_scene_description(
         groups = _infer_groups_from_proximity(humans)
 
     return SceneDescription(humans=humans, obstacles=obstacles, groups=groups)
-
-
-def _infer_state(activities: list[dict]) -> str:
-    """Pick the most socially-relevant state from an activity list."""
-    if not activities:
-        return "idle"
-
-    # Priority: talking > walking > sitting > idle
-    found: set[str] = set()
-    for act in activities:
-        name = act.get("name", "").lower()
-        state = _ACTIVITY_TO_STATE.get(name, "idle")
-        found.add(state)
-
-    for priority_state in ("talking", "walking", "sitting", "idle"):
-        if priority_state in found:
-            return priority_state
-    return "idle"
 
 
 def _infer_groups_from_edges(
@@ -267,7 +249,8 @@ def _infer_groups_from_proximity(
     """Fallback: pair two 'talking' humans if they are close enough."""
     groups: list[list[int]] = []
     used: set[int] = set()
-    talkers = [i for i, h in enumerate(humans) if h.state == "talking"]
+    _speak_acts = {"SPEAK", "TALK", "TALKING", "CONVERSATION", "CHAT"}
+    talkers = [i for i, h in enumerate(humans) if _speak_acts & set(h.activities)]
 
     for i in talkers:
         if i in used:

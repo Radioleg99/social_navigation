@@ -6,7 +6,6 @@ import os
 import re
 
 import cv2
-import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
 from mujoco import MjData
@@ -679,6 +678,28 @@ class ProcTHORMap(THORMap):
         # Optionally, store the original (base) occupancy map for reference.
         instance.occupancy_base = occ_map_5
 
+        # RGB top-down render — reuse the compiled model before freeing it.
+        instance.rgb_array = None
+        try:
+            rgb_renderer = MjOpenGLRenderer(MjModelBindings(model), height=h, width=w, device_id=device_id)
+            rgb_cam = mujoco.MjvCamera()
+            rgb_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            rgb_cam.lookat[:] = aabb_center
+            rgb_cam.distance = 8.0
+            rgb_cam.azimuth = 0
+            rgb_cam.elevation = -90
+            rgb_cam.orthographic = 1
+            rgb_renderer.update(data, rgb_cam)
+            for _cam in rgb_renderer.scene.camera:
+                _cam.orthographic = 1
+                _cam.frustum_bottom = -aabb_size[0] / 2
+                _cam.frustum_top = aabb_size[0] / 2
+            instance.rgb_array = np.asarray(rgb_renderer.render(), dtype=np.uint8)
+            rgb_renderer.close()
+            log.debug("[ProcTHORMap] RGB top-down render done")
+        except Exception as exc:
+            log.warning(f"[ProcTHORMap] RGB render failed: {exc}")
+
         # Explicitly delete temporary MuJoCo objects before garbage collection
         # These were created for map generation and are no longer needed
         del model
@@ -942,6 +963,21 @@ class iTHORMap(ProcTHORMap):
         # Flip the occupancy map. 1 is free, 0 is occupied
         occupancy = ~occupancy
 
+        # RGB top-down render — reuse the compiled model before freeing it.
+        _rgb_array = None
+        try:
+            rgb_renderer = MjOpenGLRenderer(MjModelBindings(model), height=h, width=w, device_id=device_id)
+            rgb_renderer.update(data, cam)
+            for _cam in rgb_renderer.scene.camera:
+                _cam.orthographic = 1
+                _cam.frustum_bottom = -aabb_size[0] / 2
+                _cam.frustum_top = aabb_size[0] / 2
+            _rgb_array = np.asarray(rgb_renderer.render(), dtype=np.uint8)
+            rgb_renderer.close()
+            log.debug("[iTHORMap] RGB top-down render done")
+        except Exception as exc:
+            log.warning(f"[iTHORMap] RGB render failed: {exc}")
+
         # Explicitly delete temporary MuJoCo objects before garbage collection
         # These were created for map generation and are no longer needed
         del model
@@ -950,7 +986,9 @@ class iTHORMap(ProcTHORMap):
         # Force garbage collection to free MuJoCo objects
         gc.collect()
 
-        return cls(occupancy, world_to_map, map_to_world, px_per_m)
+        instance = cls(occupancy, world_to_map, map_to_world, px_per_m)
+        instance.rgb_array = _rgb_array
+        return instance
 
     def save(self, path: str):
         if path.endswith(".png"):
@@ -1043,6 +1081,7 @@ if __name__ == "__main__":
             room_map = procthormap_loaded._room_map
             free_points_px = procthormap_loaded.pos_m_to_px(free_points[0])
 
+            import matplotlib.pyplot as plt  # lazy import — avoid Cocoa init at module load
             plt.figure()
             # filter room map to only include room 2 , keeping two dimensions
             one_room_map = room_map

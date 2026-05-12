@@ -80,6 +80,7 @@ def resolve_free_xy(
 
 @dataclass
 class MPPIConfig:
+    # MPPI algorithm params only — cost weights live in SceneCost / SocialCost
     horizon: int
     num_samples: int
     num_iters: int
@@ -92,15 +93,6 @@ class MPPIConfig:
     v_max: float
     w_max: float
     cruise_speed: float
-    goal_stage_weight: float
-    goal_terminal_weight: float
-    heading_terminal_weight: float
-    collision_penalty: float
-    clearance_threshold: float
-    clearance_weight: float
-    control_weight: float
-    smoothness_weight: float
-    social_weight: float = 0.0
 
 
 class _CorrelatedMPPI(TorchMPPI):
@@ -138,42 +130,45 @@ class _CorrelatedMPPI(TorchMPPI):
 
 
 class MPPIController:
+    """
+    Pure MPPI algorithm wrapper.
+
+    Cost computation is fully delegated to external cost objects:
+      scene_cost  : SceneCost  — obstacle/clearance/goal/control cost
+      social_cost : SocialCost — social costmap lookup cost (optional)
+
+    Both must implement .running(state, action, t) → Tensor and support
+    .set_goal() / .set_prev_action() for per-step context updates.
+    """
+
     def __init__(
         self,
         scene_map,
         grid_free: np.ndarray,
-        distance_transform: np.ndarray,
         grid_spacing: float,
         downscale: int,
         config: MPPIConfig,
         rng: np.random.Generator,
-        social_costmap: np.ndarray | None = None,
+        scene_cost,           # SceneCost instance
+        social_cost=None,     # SocialCost instance or None
     ) -> None:
-        self.scene_map = scene_map
-        self.grid_free = grid_free
-        self.distance_transform = distance_transform
-        self.grid_spacing = float(grid_spacing)
+        self.cfg      = config
+        self.rng      = rng
         self.downscale = int(downscale)
-        self.cfg = config
-        self.rng = rng
 
         self.device = torch.device("cpu")
-        self.dtype = torch.float32
+        self.dtype  = torch.float32
+
+        self._scene_cost  = scene_cost
+        self._social_cost = social_cost
+
+        # kept for _build_info (clearance along best trajectory)
         self.world_to_map_t = torch.as_tensor(scene_map.world_to_map, dtype=self.dtype, device=self.device)
-        self.grid_free_t = torch.as_tensor(grid_free, dtype=torch.bool, device=self.device)
-        self.distance_transform_t = torch.as_tensor(
-            distance_transform, dtype=self.dtype, device=self.device
-        )
-        # social costmap：shape 同 grid_free，值域 [0,1]，0=无代价
-        if social_costmap is not None:
-            self.social_costmap_t = torch.as_tensor(
-                social_costmap.astype(np.float32), dtype=self.dtype, device=self.device
-            )
-        else:
-            self.social_costmap_t = None
-        self._goal_xy_t = torch.zeros(2, dtype=self.dtype, device=self.device)
-        self.prev_action = np.zeros(2, dtype=np.float32)
+        self.grid_free_t    = torch.as_tensor(grid_free, dtype=torch.bool, device=self.device)
+
+        self.prev_action   = np.zeros(2, dtype=np.float32)
         self.prev_action_t = torch.zeros(2, dtype=self.dtype, device=self.device)
+        self._goal_xy_t    = torch.zeros(2, dtype=self.dtype, device=self.device)
         self._initial_action_t = torch.tensor(
             [float(config.cruise_speed), 0.0], dtype=self.dtype, device=self.device
         )
@@ -187,6 +182,9 @@ class MPPIController:
 
     def command(self, state: np.ndarray, goal_xy: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
         self._goal_xy_t = torch.as_tensor(goal_xy, dtype=self.dtype, device=self.device)
+        self._scene_cost.set_goal(goal_xy)
+        self._scene_cost.set_prev_action(self.prev_action)
+
         state_t = torch.as_tensor(self._augment_state(state), dtype=self.dtype, device=self.device)
         torch.manual_seed(int(self.rng.integers(0, 2**31 - 1)))
 
@@ -203,6 +201,12 @@ class MPPIController:
         self.prev_action = action.copy()
         self.prev_action_t = torch.as_tensor(action, dtype=self.dtype, device=self.device)
         return action, info
+
+    def _combined_running_cost(self, state: torch.Tensor, action: torch.Tensor, t: int) -> torch.Tensor:
+        cost = self._scene_cost.running(state, action, t)
+        if self._social_cost is not None:
+            cost = cost + self._social_cost.running(state, action, t)
+        return cost
 
     def _build_controller(self) -> _CorrelatedMPPI:
         noise_sigma = torch.diag(
@@ -227,8 +231,8 @@ class MPPIController:
         )
         return _CorrelatedMPPI(
             dynamics=self._dynamics_torch,
-            running_cost=self._running_cost_torch,
-            terminal_state_cost=self._terminal_cost_torch,
+            running_cost=self._combined_running_cost,
+            terminal_state_cost=self._scene_cost.terminal,
             nx=3,
             noise_sigma=noise_sigma,
             num_samples=int(self.cfg.num_samples),
@@ -265,106 +269,6 @@ class MPPIController:
         next_state[:, 5:7] = last_action
         return next_state
 
-    def _running_cost_torch(self, state: torch.Tensor, action: torch.Tensor, _t: int) -> torch.Tensor:
-        pos = state[:, :2]
-        goal_dist = torch.linalg.norm(pos - self._goal_xy_t.unsqueeze(0), dim=-1)
-        clearance, collision = self._clearance_and_collision_torch(pos)
-        clearance_violation = torch.clamp(float(self.cfg.clearance_threshold) - clearance, min=0.0)
-
-        if state.shape[-1] >= 7:
-            prev_action = state[:, 5:7]
-        else:
-            prev_action = self.prev_action_t.expand_as(action)
-        control_delta = action - prev_action
-
-        cost = float(self.cfg.goal_stage_weight) * goal_dist
-        cost = cost + float(self.cfg.clearance_weight) * torch.square(clearance_violation)
-        cost = cost + float(self.cfg.collision_penalty) * collision.to(self.dtype)
-        cost = cost + float(self.cfg.control_weight) * (
-            torch.square(action[:, 0]) + 0.25 * torch.square(action[:, 1])
-        )
-        cost = cost + float(self.cfg.smoothness_weight) * torch.sum(torch.square(control_delta), dim=-1)
-
-        # social cost：从 LLM 生成的 costmap 查表
-        if self.social_costmap_t is not None and float(self.cfg.social_weight) > 0.0:
-            social = self._lookup_social_cost_torch(pos)
-            cost = cost + float(self.cfg.social_weight) * social
-
-        return cost
-
-    def _lookup_social_cost_torch(self, xy: torch.Tensor) -> torch.Tensor:
-        """在 social_costmap_t 上查表，越界格子返回 0。"""
-        flat_xy = xy.reshape(-1, 2)
-        xyz = torch.zeros((flat_xy.shape[0], 3), dtype=self.dtype, device=self.device)
-        xyz[:, :2] = flat_xy
-        hom = torch.cat(
-            (xyz, torch.ones((flat_xy.shape[0], 1), dtype=self.dtype, device=self.device)), dim=-1
-        )
-        px = torch.round(hom @ self.world_to_map_t.T)
-        grid = torch.floor(px / self.downscale).to(torch.long)
-        row = grid[:, 0]
-        col = grid[:, 1]
-        in_bounds = (
-            (row >= 0)
-            & (row < self.social_costmap_t.shape[0])
-            & (col >= 0)
-            & (col < self.social_costmap_t.shape[1])
-        )
-        social = torch.zeros(flat_xy.shape[0], dtype=self.dtype, device=self.device)
-        if torch.any(in_bounds):
-            social[in_bounds] = self.social_costmap_t[row[in_bounds], col[in_bounds]]
-        return social.reshape(xy.shape[:-1])
-
-    def _terminal_cost_torch(self, states: torch.Tensor, _actions: torch.Tensor) -> torch.Tensor:
-        if states.dim() == 4:
-            final_state = states[0, :, -1, :]
-        else:
-            final_state = states[:, -1, :]
-
-        final_goal_vec = self._goal_xy_t.unsqueeze(0) - final_state[:, :2]
-        final_goal_dist = torch.linalg.norm(final_goal_vec, dim=-1)
-        desired_heading = torch.atan2(final_goal_vec[:, 1], final_goal_vec[:, 0])
-        heading_error = torch.abs(_wrap_to_pi_torch(desired_heading - final_state[:, 2]))
-        return (
-            float(self.cfg.goal_terminal_weight) * final_goal_dist
-            + float(self.cfg.heading_terminal_weight) * heading_error
-        )
-
-    def _clearance_and_collision_torch(
-        self, xy: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        flat_xy = xy.reshape(-1, 2)
-        xyz = torch.zeros((flat_xy.shape[0], 3), dtype=self.dtype, device=self.device)
-        xyz[:, :2] = flat_xy
-        hom = torch.cat(
-            (xyz, torch.ones((flat_xy.shape[0], 1), dtype=self.dtype, device=self.device)), dim=-1
-        )
-        px = torch.round(hom @ self.world_to_map_t.T)
-        grid = torch.floor(px / self.downscale).to(torch.long)
-
-        row = grid[:, 0]
-        col = grid[:, 1]
-        in_bounds = (
-            (row >= 0)
-            & (row < self.grid_free_t.shape[0])
-            & (col >= 0)
-            & (col < self.grid_free_t.shape[1])
-        )
-
-        clearance = torch.zeros(flat_xy.shape[0], dtype=self.dtype, device=self.device)
-        collision = ~in_bounds
-        if torch.any(in_bounds):
-            free = torch.zeros_like(in_bounds)
-            free[in_bounds] = self.grid_free_t[row[in_bounds], col[in_bounds]]
-            collision = collision | ~free
-            valid = in_bounds & free
-            if torch.any(valid):
-                clearance[valid] = (
-                    self.distance_transform_t[row[valid], col[valid]] * float(self.grid_spacing)
-                )
-
-        return clearance.reshape(xy.shape[:-1]), collision.reshape(xy.shape[:-1])
-
     def _build_info(self) -> dict[str, float]:
         best_cost = math.inf
         mean_cost = math.inf
@@ -384,12 +288,24 @@ class MPPIController:
                     pred_final_goal_dist = float(
                         torch.linalg.norm(final_xy - self._goal_xy_t).detach().cpu().item()
                     )
-                    clearance, collision = self._clearance_and_collision_torch(best_xy)
-                    safe_clearance = clearance[~collision]
-                    if safe_clearance.numel() > 0:
-                        best_clearance = float(torch.min(safe_clearance).detach().cpu().item())
-                    else:
-                        best_clearance = 0.0
+                    best_xy_np = best_xy.detach().cpu().numpy()
+                    xyz = np.zeros((best_xy_np.shape[0], 3), dtype=np.float32)
+                    xyz[:, :2] = best_xy_np
+                    clearance_np, collision_np = self._scene_cost.clearance_of(xyz[:, :2])
+                    safe = clearance_np[~collision_np]
+                    best_clearance = float(np.min(safe)) if safe.size > 0 else 0.0
+
+        # Top-K rollout trajectories for visualization (xy only, CPU numpy)
+        rollout_xy: np.ndarray | None = None
+        rollout_costs: np.ndarray | None = None
+        if (self._controller.cost_total is not None
+                and self._controller.states is not None):
+            costs_np = self._controller.cost_total.detach().cpu().numpy()
+            states_np = self._controller.states[0].detach().cpu().numpy()  # (N, H, state)
+            K = min(80, len(costs_np))
+            top_k = np.argpartition(costs_np, K)[:K]
+            rollout_xy = states_np[top_k, :, :2]          # (K, H, 2)
+            rollout_costs = costs_np[top_k]                # (K,)
 
         action_seq = self._controller.get_action_sequence()
         action = action_seq[0].detach().cpu().numpy().astype(np.float32)
@@ -400,6 +316,8 @@ class MPPIController:
             "pred_final_goal_dist": pred_final_goal_dist,
             "action_v": float(action[0]),
             "action_w_deg": math.degrees(float(action[1])),
+            "rollout_xy": rollout_xy,
+            "rollout_costs": rollout_costs,
         }
 
 

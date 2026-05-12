@@ -1,141 +1,80 @@
-# Social Navigation Layout
+# Social Navigation Experiments
 
-This repo already has a clear split between environment code and policy code. For social navigation work,
-keep that split explicit instead of putting all research code into one folder.
+This folder is now scoped to the two-stage workflow described in
+`experiements.md`.
 
-## Recommended Ownership
+## Stage 1: Static Social Path Validation
 
-`molmo_spaces/`
-- Environment backend
-- Scene loading and randomization
-- Task and task sampler abstractions
-- Reusable policy implementations that should plug into the framework
+Goal: verify whether an LLM or deterministic rule prompt can produce a
+reasonable social cost map, then use social-cost-aware A* to choose a route
+that avoids socially inappropriate areas.
 
-`experiments/social_nav/`
-- Experiment entrypoints
-- Hyperparameter sweeps
-- Ablations
-- Training scripts
-- Evaluation scripts
-- Result analysis notebooks or summaries
-
-## How Navigation Pieces Fit Together
-
-`tasks/nav_task_sampler.py`
-- Samples an episode
-- Chooses scene, target object, robot spawn
-- Prepares occupancy maps and randomized scene state
-
-`tasks/nav_task.py`
-- Defines what the task means
-- Computes reward, success, and metrics
-- Exposes task-relevant observations
-
-`policy/solvers/navigation/`
-- Decides how to move
-- Holds reusable planners/controllers such as A* or MPPI
-- Should stay algorithm-focused, not experiment-focused
-
-## Recommended Social Navigation Extension Path
-
-1. Keep `molmo_spaces/tasks/nav_task_sampler.py` for scene and target generation.
-2. Introduce a new social-nav task instead of overloading the current object-nav success logic.
-3. Add reusable navigation policies under `molmo_spaces/policy/solvers/navigation/`.
-4. Put training and benchmark orchestration under `experiments/social_nav/`.
-
-## Suggested Next Files
-
-If social navigation becomes the main focus, these are the next useful additions:
-
-`molmo_spaces/tasks/social_nav_task.py`
-- Goal reaching plus social metrics
-
-`molmo_spaces/configs/base_social_nav_config.py`
-- Experiment config that pairs a social-nav task with a navigation policy
-
-`experiments/social_nav/run_mppi.py`
-- Debug and benchmark entrypoint for MPPI
-
-`experiments/social_nav/train_policy.py`
-- Training entrypoint for learned policies
-
-## Current Entrypoints
-
-Use:
-
-`experiments/social_nav/run_social_nav.py`
-
-or the MPPI convenience wrapper:
-
-`experiments/social_nav/run_mppi.py`
-
-This now uses a proper social-navigation experiment structure:
-
-- `experiments/social_nav/manager.py`
-- `experiments/social_nav/context.py`
-- `experiments/social_nav/methods/base.py`
-- `experiments/social_nav/methods/mppi.py`
-
-The reusable controller implementation still stays under
-`molmo_spaces/policy/solvers/navigation/`, but the episode orchestration now lives in
-`experiments/social_nav/`.
-
-Example:
+Primary entrypoints:
 
 ```bash
-./.venv/bin/mjpython experiments/social_nav/run_social_nav.py \
-  --method mppi \
-  --scene-xml assets/scenes/ithor/FloorPlan203_physics.xml \
-  --layout-json assets/layouts/FloorPlan203_object_positions.json \
-  --layout-runtime auto \
-  --robot-type navbot \
-  --start-pose=-1.4,4.6,0 \
-  --goal-xy=-0.6,4.6
+./.venv/bin/python experiments/social_nav/run_stage1_static.py \
+  --birdview-image outputs/procthor/train_9/debug_grid_free.png \
+  --map-bounds 0,10,0,6 \
+  --scene-graph outputs/procthor/train_9/scene_graph.json \
+  --start-pose 1.0,1.0,0 \
+  --goal-xy 8.0,5.0 \
+  --social-method rule \
+  --save-topdown outputs/stage1_static.png \
+  --out-json outputs/stage1_static.json
 ```
 
-## What `goal` Means
+```bash
+./.venv/bin/python experiments/social_nav/stage1_playground.py \
+  --birdview-image outputs/procthor/train_9/debug_grid_free.png \
+  --map-bounds 0,10,0,6 \
+  --scene-graph outputs/procthor/train_9/scene_graph.json
+```
 
-For the current experiment demo, `goal` is a 2D target point in world coordinates:
+Use `--social-method llm --llm-model <model>` only when you explicitly want to
+spend an API call. The default interactive workflow uses rule-based social cost
+and only refreshes LLM cost when requested.
 
-- `--goal-xy=x,y`
-- Units are meters
-- Coordinate frame is the same MuJoCo world frame used by the scene layout JSON
+## Stage 2: Dynamic Social Navigation
 
-The demo may snap the requested goal to the nearest reachable free cell before planning if the
-exact point is occupied or too close to obstacles.
+Goal: scripted human motion and relationship changes, with A* providing the
+global route and MPPI handling local collision avoidance and short-horizon
+adjustment.
 
-## Where To Adjust It
+Primary entrypoint:
 
-For the experiment demo:
+```bash
+./.venv/bin/python experiments/social_nav/run_stage2_dynamic.py
+```
 
-- CLI flag: `--goal-xy`
-- Start pose: `--start-pose=x,y,yaw_deg`
-- Success radius: `--goal-radius`
+The Stage2 simulator updates human positions and relationships, regenerates
+the deterministic social costmap in real time, replans A*, and tracks the route
+with MPPI. LLM mode can be toggled in the UI; if the API call is unavailable,
+the shared rule-based costmap is used as a fallback.
 
-For scene-specific targets:
+## Shared Cost Modules
 
-- Put candidate target coordinates in an experiment config, shell script, or notebook under
-  `experiments/social_nav/`
-- Keep scene geometry and human placement in layout JSON files under `assets/layouts/`
+`cost/llm_costmap.py`
+- scene graph or live agents -> social parameters
+- rule baseline and LLM pipeline
+- Gaussian costmap synthesis for A* and visualization
 
-For the reusable framework policy path:
+`cost/scene_cost.py`
+- hard wall / human-body constraints for MPPI
+- goal, clearance, control, and smoothness terms
 
-- `molmo_spaces/policy/solvers/navigation/mppi_policy.py`
-- The policy resolves the target from either:
-  - `task.get_nearest_nav_object(...)`
-  - `task.config.task_config.goal_xy`
-  - `task.config.task_config.point_goal_xy`
+`cost/social_cost.py`
+- local continuous social cost used inside MPPI
 
-So if later you run MPPI through the task/policy framework instead of the standalone demo,
-the goal should be set in task config rather than passed as `--goal-xy`.
+## Kept Entrypoints
 
-## Method Boundary
+`run_pipeline.py`
+- HumanSSG scene graph -> optional layout -> Stage1 static planning
 
-The key design rule is:
+`run_social_nav.py`
+- full MuJoCo A* + MPPI validation path
 
-- `manager.py` owns the episode loop and scene orchestration
-- `methods/` owns the interchangeable decision logic
+`run_procthor.py`
+- convenience wrapper for ProcTHOR scene selection and full validation
 
-That means MPPI is now just one method implementation. If you later add A*, RL, a social-force
-model, or a learned local planner, it should implement the same interface under
-`experiments/social_nav/methods/` rather than re-creating another standalone script.
+Deprecated duplicate demo/test/config files were removed so the experiment
+surface stays small and runnable.

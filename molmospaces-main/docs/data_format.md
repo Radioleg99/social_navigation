@@ -51,7 +51,6 @@ traj_{ep_idx}/
 
 After generating data, it must be postprocessed for consumption by a training pipeline. See [the documentation](data_processing.md) for more information.
 
-
 ### Final h5 root structure
 
 The data postprocessing doesn't modify any existing data in the h5 files, it only adds new groups and values to the root of the file.
@@ -63,3 +62,4 @@ traj_{i}/
 stats/
 valid_traj_mask
 ```
+

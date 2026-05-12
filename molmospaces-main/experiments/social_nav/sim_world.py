@@ -153,59 +153,39 @@ def conversation_groups(rels: list[tuple[str, str, str]]) -> list[list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Social Costmap（纯 numpy，不依赖 llm_costmap 模块）
+# Social Costmap
 # ---------------------------------------------------------------------------
-
-# 各状态的社交参数
-_PARAMS = {
-    "talking":   dict(score=0.9, ps=1.2, os=2.5),
-    "walking":   dict(score=0.7, ps=1.0, os=1.8),
-    "sitting":   dict(score=0.6, ps=0.9, os=1.5),
-    "standing":  dict(score=0.5, ps=0.8, os=1.3),
-}
-
 
 def build_costmap(agents: dict[str, Agent],
                   groups: list[list[str]],
-                  shape:  tuple[int, int]) -> np.ndarray:
-    """给定所有 agent 状态，直接合成 social costmap。"""
-    H, W = shape
-    cols = np.linspace(X_MIN, X_MAX, W, endpoint=False) + (X_MAX - X_MIN) / W / 2
-    rows = np.linspace(Y_MAX, Y_MIN, H, endpoint=False) - (Y_MAX - Y_MIN) / H / 2
-    CX, CY = np.meshgrid(cols, rows)
+                  shape: tuple[int, int]) -> np.ndarray:
+    """Build the deterministic rule costmap via the shared cost pipeline."""
+    from experiments.social_nav.cost.llm_costmap import build_live_costmap
 
-    field = np.zeros((H, W), dtype=np.float32)
+    cm, _ = build_live_costmap(
+        agents,
+        shape,
+        x_range=(X_MIN, X_MAX),
+        y_range=(Y_MIN, Y_MAX),
+        method="rule",
+        groups=groups,
+    )
+    return cm
 
-    for ag in agents.values():
-        p   = _PARAMS.get(ag.activity, _PARAMS["standing"])
-        hx, hy = float(ag.pos[0]), float(ag.pos[1])
-        yaw    = math.radians(ag.heading_deg)
-        fx, fy = math.cos(yaw), math.sin(yaw)
 
-        dx = CX - hx; dy = CY - hy
-        along = dx * fx + dy * fy
-        perp  = -dx * fy + dy * fx
+def build_costmap_and_params(agents: dict[str, Agent],
+                             groups: list[list[str]],
+                             shape: tuple[int, int]):
+    from experiments.social_nav.cost.llm_costmap import build_live_costmap
 
-        sf = p["ps"] * p["os"]   # sigma_front
-        sb = p["ps"]              # sigma_back
-        ss = p["ps"]              # sigma_side
-
-        sa = np.where(along >= 0, sf, sb)
-        cost = p["score"] * np.exp(
-            -(along ** 2) / (2 * sa ** 2)
-            -(perp  ** 2) / (2 * ss ** 2)
-        )
-        field = np.maximum(field, cost.astype(np.float32))
-
-    # 对话群组：群组中心额外高代价
-    for grp in groups:
-        gx = float(np.mean([agents[aid].pos[0] for aid in grp if aid in agents]))
-        gy = float(np.mean([agents[aid].pos[1] for aid in grp if aid in agents]))
-        dx = CX - gx; dy = CY - gy
-        group_cost = np.exp(-(dx**2 + dy**2) / (2 * 0.5**2)).astype(np.float32)
-        field = np.maximum(field, group_cost)
-
-    return np.clip(field, 0.0, 1.0)
+    return build_live_costmap(
+        agents,
+        shape,
+        x_range=(X_MIN, X_MAX),
+        y_range=(Y_MIN, Y_MAX),
+        method="rule",
+        groups=groups,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +287,8 @@ class SimWorld:
         occ[:1,:]=occ[-1:,:]=occ[:,:1]=occ[:,-1:]=False
         self._occ = occ
 
-        from molmo_spaces.policy.solvers.navigation.mppi_core import (
-            make_downscaled_grid, MPPIConfig, MultiModalMPPIController,
-        )
-        import torch
+        from experiments.social_nav.mppi_nav import MPPINav
+        from molmo_spaces.policy.solvers.navigation.mppi_core import make_downscaled_grid
 
         class _Map:
             def __init__(self, occ, w2m):
@@ -335,38 +313,46 @@ class SimWorld:
 
         # 初始 costmap + A*
         self._update_agents()
-        self.social_cm = build_costmap(self.agents, self.groups, self.grid_free.shape)
+        self.social_cm, self.social_params = build_costmap_and_params(
+            self.agents, self.groups, self.grid_free.shape
+        )
         self.waypoints = astar(self.grid_free, self.social_cm,
                                self.robot_pos, self.ROBOT_GOAL,
                                social_w=self.social_w)
         self._wp_idx   = 0
         self._prev_cm  = self.social_cm.copy()
 
-        # MPPI
-        cfg = MPPIConfig(
-            horizon=40, num_samples=512, num_iters=3,
-            dt=dt, temperature=1.0, noise_alpha=0.8,
-            noise_v=0.12, noise_w=math.radians(35),
-            v_min=-0.05, v_max=0.40, w_max=math.radians(120),
-            cruise_speed=0.20,
-            goal_stage_weight=4.0, goal_terminal_weight=20.0,
-            heading_terminal_weight=0.5,
-            collision_penalty=300.0, clearance_threshold=0.25,
-            clearance_weight=20.0, control_weight=0.1,
-            smoothness_weight=1.0, social_weight=social_weight,
-        )
-        self._ctrl = MultiModalMPPIController(
+        self._ctrl = MPPINav(
             scene_map=self._map,
             grid_free=self.grid_free,
             distance_transform=self._dist_tf,
             grid_spacing=GRID_SPACING,
             downscale=DOWNSCALE,
-            config=cfg,
-            rng=np.random.default_rng(42),
-            social_costmap=self.social_cm,
+            horizon=40,
+            num_samples=512,
+            num_iters=3,
+            dt=dt,
+            temperature=1.0,
+            noise_alpha=0.8,
+            noise_v=0.12,
+            noise_w_deg=35,
+            v_min=-0.05,
+            v_max=0.40,
+            w_max_deg=120,
+            cruise_speed=0.20,
+            goal_stage_weight=4.0,
+            goal_terminal_weight=20.0,
+            heading_terminal_weight=0.5,
+            clearance_threshold=0.25,
+            clearance_weight=20.0,
+            control_weight=0.1,
+            smoothness_weight=1.0,
+            social_params=self.social_params,
+            social_weight=social_weight,
+            human_positions=[tuple(a.pos) for a in self.agents.values()],
+            human_radius=0.30,
+            seed=42,
         )
-        self._torch = torch
-        self._cfg   = cfg
 
         # 统计
         self.n_replans = 0
@@ -383,13 +369,17 @@ class SimWorld:
         self._update_agents()
 
         # 2. 重算 social costmap
-        new_cm = build_costmap(self.agents, self.groups, self.grid_free.shape)
+        new_cm, new_params = build_costmap_and_params(
+            self.agents, self.groups, self.grid_free.shape
+        )
+        self._ctrl.update_humans([tuple(a.pos) for a in self.agents.values()])
 
         # 3. 如果 costmap 变化显著 → A* 重规划
         diff = float(np.abs(new_cm - self._prev_cm).max())
         if diff > 0.05:
             self.social_cm = new_cm
-            self._sync_costmap_to_mppi()
+            self.social_params = new_params
+            self._ctrl.update_social_params(new_params)
             self.waypoints = astar(self.grid_free, self.social_cm,
                                    self.robot_pos, self.ROBOT_GOAL,
                                    social_w=self.social_w)
@@ -413,14 +403,13 @@ class SimWorld:
         # 6. MPPI → robot 移动（与 agent 移动同时发生在同一 dt 内）
         state  = np.array([self.robot_pos[0], self.robot_pos[1], self.robot_yaw],
                           dtype=np.float32)
-        action, _ = self._ctrl.command(state, target)
-        v, w = float(action[0]), float(action[1])
+        v, w, _ = self._ctrl.step(state, target)
 
-        self.robot_pos[0] += self._cfg.dt * v * math.cos(self.robot_yaw)
-        self.robot_pos[1] += self._cfg.dt * v * math.sin(self.robot_yaw)
+        self.robot_pos[0] += self.dt * v * math.cos(self.robot_yaw)
+        self.robot_pos[1] += self.dt * v * math.sin(self.robot_yaw)
         self.robot_yaw     = math.atan2(
-            math.sin(self.robot_yaw + self._cfg.dt * w),
-            math.cos(self.robot_yaw + self._cfg.dt * w),
+            math.sin(self.robot_yaw + self.dt * w),
+            math.cos(self.robot_yaw + self.dt * w),
         )
         self.robot_traj.append(self.robot_pos.copy())
         self.t += self.dt
@@ -431,14 +420,6 @@ class SimWorld:
                        for aid, sa in self._scripted.items()}
         self.rels   = active_relationships(self._rel_events, self.t)
         self.groups = conversation_groups(self.rels)
-
-    def _sync_costmap_to_mppi(self) -> None:
-        cm_t = self._torch.as_tensor(
-            self.social_cm, dtype=self._torch.float32, device="cpu"
-        )
-        for c in self._ctrl.controllers:
-            c.social_costmap_t = cm_t
-
 
 # ---------------------------------------------------------------------------
 # 预定义场景

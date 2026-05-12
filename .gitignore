@@ -53,6 +53,7 @@ ai_test_results/
 3dsg/HumanSSG/conceptgraph/slam/outputs/
 3dsg/HumanSSG/conceptgraph/slam/humanssg/outputs/
 mapping_process.log
+3dsg/HumanSSG
 
 # ── Secrets / env ────────────────────────────────────────────────────────────
 .env
@@ -69,3 +70,14 @@ Miniconda3-*.sh
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
+
+# ── Claude Code ──────────────────────────────────────────────────────────────
+.claude/
+
+# ── Local test scripts ───────────────────────────────────────────────────────
+test/
+test_kimi_api.py
+
+# ── Data capture ─────────────────────────────────────────────────────────────
+molmospaces-main/data_capture/
+

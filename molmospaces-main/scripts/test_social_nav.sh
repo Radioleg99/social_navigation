@@ -22,10 +22,14 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   PYTHON_BIN="./.venv/bin/mjpython"
 fi
 
+SCENE="${SCENE:-assets/scenes/ithor/FloorPlan203_physics.xml}"
+LAYOUT="${LAYOUT:-assets/layouts/FloorPlan203_object_positions.json}"
+SOCIAL_METHOD="${SOCIAL_METHOD:-rule}"
+
 COMMON_ARGS=(
-  experiments/social_nav/run_mppi.py
-  --scene-xml assets/scenes/ithor/FloorPlan203_physics.xml
-  --layout-json assets/layouts/FloorPlan203_object_positions.json
+  experiments/social_nav/run_social_nav.py
+  --scene-xml "$SCENE"
+  --layout-json "$LAYOUT"
   --layout-runtime auto
   --robot-type navbot
   --start-pose="$START_POSE"
@@ -33,12 +37,14 @@ COMMON_ARGS=(
   --goal-radius 0.25
   --max-steps "$MAX_STEPS"
   --log-every 20
+  --social-method "$SOCIAL_METHOD"
+  --save-topdown outputs/topdown_latest.png
 )
 
 if [[ "$MODE" == "viewer" ]]; then
-  MPLCONFIGDIR=/tmp/matplotlib XDG_CACHE_HOME=/tmp "$PYTHON_BIN" "${COMMON_ARGS[@]}"
+  MPLCONFIGDIR=/tmp/matplotlib XDG_CACHE_HOME=/tmp MPLBACKEND=Agg "$PYTHON_BIN" "${COMMON_ARGS[@]}"
 elif [[ "$MODE" == "headless" ]]; then
-  MPLCONFIGDIR=/tmp/matplotlib XDG_CACHE_HOME=/tmp "$PYTHON_BIN" "${COMMON_ARGS[@]}" --no-viewer
+  MPLCONFIGDIR=/tmp/matplotlib XDG_CACHE_HOME=/tmp MPLBACKEND=Agg "$PYTHON_BIN" "${COMMON_ARGS[@]}" --no-viewer
 else
   echo "Unknown mode: $MODE"
   echo "Use: headless | viewer"

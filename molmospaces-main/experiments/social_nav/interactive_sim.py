@@ -4,9 +4,8 @@ Social Navigation Simulator  —  游戏风格交互
 底部工具栏：工具组 + 动作组（Play / Reset / Costmap / 🤖Auto / 🧠LLM）
 [ / ] 键调整 social weight
 
-🤖 Auto  : agent 自主 FSM（idle → walk → talk → idle）
-🧠 LLM   : 每 5 s 调用 LLM 重新推断 costmap（需配置 API key）
-            无 key 时自动 fallback 到 rule-based
+Auto  : agent 自主 FSM（idle -> walk -> talk -> idle）
+LLM   : 手动/周期调用 LLM 重新推断 costmap；无 key 时自动 fallback 到 rule-based
 
 运行：
     ./.venv/bin/python3 experiments/social_nav/interactive_sim.py
@@ -204,7 +203,6 @@ ACTIONS = [
     dict(id="costmap", icon="🌡", label="Costmap"),
     dict(id="auto",    icon="🤖", label="Auto"),
     dict(id="llm",     icon="🧠", label="LLM"),
-    dict(id="nn",      icon="⚡", label="NN"),
 ]
 
 
@@ -254,24 +252,20 @@ class Sim:
         self._drag_agent : IAAgent | None = None
         self._drag_off   = (0.0, 0.0)
 
-        # Autonomous / LLM / NN mode
+        # Autonomous / LLM mode
         self.auto_agents  = False
         self._llm_mode    = False
         self._llm_timer   = 0.0
         self._llm_status  = ""
-        self._nn_mode     = False
-        self._nn_model    = None    # SocialCostFormer (loaded lazily)
-        self._nn_tok      = None    # SceneTokenizer
-        self._nn_status   = ""
         self._rng         = np.random.default_rng(42)
 
         # Internal nav
         self._ctrl        = None
-        self._cfg         = None
         self._gf          = None
         self._dtf         = None
         self._smap        = None
         self.social_cm    = None
+        self.social_params = []
         self._cm_surf     = None
         self._cm_dirty    = True
         self._prev_cm_sum = 0.0
@@ -281,8 +275,8 @@ class Sim:
 
     # ── 场景构建 ─────────────────────────────────────────────────────────────
     def _rebuild(self):
-        from molmo_spaces.policy.solvers.navigation.mppi_core import (
-            make_downscaled_grid, MPPIConfig, MultiModalMPPIController)
+        from experiments.social_nav.mppi_nav import MPPINav
+        from molmo_spaces.policy.solvers.navigation.mppi_core import make_downscaled_grid
 
         H = round((Y_MAX - Y_MIN) * PX_PER_M)
         W = round((X_MAX - X_MIN) * PX_PER_M)
@@ -310,23 +304,34 @@ class Sim:
         self._dtf  = distance_transform_edt(self._gf).astype(np.float32)
 
         self._update_cm(force=True)
-        self._cfg = MPPIConfig(
-            horizon=40, num_samples=512, num_iters=3,
-            dt=self.SIM_DT, temperature=1.0, noise_alpha=0.8,
-            noise_v=0.12, noise_w=math.radians(35),
-            v_min=-0.05, v_max=0.40, w_max=math.radians(120),
+        self._ctrl = MPPINav(
+            scene_map=self._smap,
+            grid_free=self._gf,
+            distance_transform=self._dtf,
+            grid_spacing=GRID_SPACING,
+            downscale=DOWNSCALE,
+            horizon=40,
+            num_samples=512,
+            num_iters=3,
+            dt=self.SIM_DT,
+            temperature=1.0,
+            noise_alpha=0.8,
+            noise_v=0.12,
+            noise_w_deg=35,
+            v_min=-0.05,
+            v_max=0.40,
+            w_max_deg=120,
             cruise_speed=0.20,
             goal_stage_weight=4.0, goal_terminal_weight=20.0,
             heading_terminal_weight=0.5,
-            collision_penalty=300.0, clearance_threshold=0.25,
+            clearance_threshold=0.25,
             clearance_weight=20.0, control_weight=0.1,
-            smoothness_weight=1.0, social_weight=self.social_w,
-        )
-        self._ctrl = MultiModalMPPIController(
-            scene_map=self._smap, grid_free=self._gf,
-            distance_transform=self._dtf, grid_spacing=GRID_SPACING,
-            downscale=DOWNSCALE, config=self._cfg,
-            rng=np.random.default_rng(42), social_costmap=self.social_cm,
+            smoothness_weight=1.0,
+            social_params=self.social_params,
+            social_weight=self.social_w,
+            human_positions=[tuple(a.pos) for a in self.agents],
+            human_radius=0.30,
+            seed=42,
         )
         self._replan()
 
@@ -341,67 +346,25 @@ class Sim:
         self._replan()
 
     # ── Costmap ──────────────────────────────────────────────────────────────
-    def _load_nn_model(self) -> bool:
-        """Lazily load SocialCostFormer checkpoint. Returns True if ready."""
-        if self._nn_model is not None:
-            return True
-        ckpt = Path("checkpoints/scf.pt")
-        if not ckpt.exists():
-            self._nn_status = "No checkpoint — run --train first"
-            return False
-        try:
-            from experiments.social_nav.social_cost_net import (
-                SocialCostFormer, SceneTokenizer)
-            self._nn_model  = SocialCostFormer.load(ckpt)
-            self._nn_tok    = SceneTokenizer()
-            self._nn_status = "ready"
-            return True
-        except Exception as exc:
-            self._nn_status = f"Load error: {str(exc)[:40]}"
-            return False
-
-    def _update_cm_nn(self, force: bool = False) -> bool:
-        """Recompute costmap using SocialCostFormer neural model."""
-        if not self._load_nn_model():
-            return False
-        ad     = {a.id: a.to_agent() for a in self.agents}
-        groups = self._get_conv_groups()
-        feats, mask = self._nn_tok.encode(
-            ad, self.robot_pos, self.robot_goal, groups)
-        cm = self._nn_model.predict(feats, mask)   # (GRID_H, GRID_W)
-
-        # resize if grid shapes differ
-        if cm.shape != self._gf.shape:
-            from scipy.ndimage import zoom
-            cm = zoom(cm, (self._gf.shape[0] / cm.shape[0],
-                           self._gf.shape[1] / cm.shape[1]), order=1)
-        cm = cm.astype(np.float32)
-        s = float(cm.sum())
-        if not force and abs(s - self._prev_cm_sum) < 0.1:
-            return False
-        self.social_cm    = cm
-        self._prev_cm_sum = s
-        self._cm_dirty    = True
-        return True
-
     def _update_cm(self, force: bool = False) -> bool:
-        """Recompute costmap. Dispatch to rule / LLM / NN based on active mode."""
+        """Recompute deterministic rule costmap unless a background LLM update owns it."""
         if self._gf is None:
             return False
         if self._llm_mode:
             return False   # LLM thread owns social_cm
-        if self._nn_mode:
-            return self._update_cm_nn(force=force)
 
         ad = {a.id: a.to_agent() for a in self.agents}
         if not ad:
             cm = np.zeros(self._gf.shape, dtype=np.float32)
+            params = []
         else:
-            from experiments.social_nav.llm_costmap import build_live_costmap
-            cm, _ = build_live_costmap(
+            from experiments.social_nav.cost.llm_costmap import build_live_costmap
+            cm, params = build_live_costmap(
                 ad, self._gf.shape,
                 x_range=(X_MIN, X_MAX), y_range=(Y_MIN, Y_MAX),
                 method="rule",
+                robot_pos=self.robot_pos,
+                robot_goal=self.robot_goal,
                 groups=self._get_conv_groups(),
             )
 
@@ -409,6 +372,7 @@ class Sim:
         if not force and abs(s - self._prev_cm_sum) < 0.1:
             return False
         self.social_cm    = cm
+        self.social_params = params
         self._prev_cm_sum = s
         self._cm_dirty    = True
         return True
@@ -442,7 +406,7 @@ class Sim:
 
         def _worker():
             try:
-                from experiments.social_nav.llm_costmap import build_live_costmap
+                from experiments.social_nav.cost.llm_costmap import build_live_costmap
                 cm, params = build_live_costmap(
                     agents_snap, grid_shape,
                     x_range=(X_MIN, X_MAX), y_range=(Y_MIN, Y_MAX),
@@ -451,6 +415,7 @@ class Sim:
                     groups=groups, t=t,
                 )
                 self.social_cm    = cm
+                self.social_params = params
                 self._cm_dirty    = True
                 self._prev_cm_sum = float(cm.sum())
                 self._llm_status  = f"Updated  t={t:.1f}s"
@@ -466,12 +431,10 @@ class Sim:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _sync_cm(self):
-        import torch
-        if self.social_cm is None or self._ctrl is None:
+        if self._ctrl is None:
             return
-        t = torch.as_tensor(self.social_cm, dtype=torch.float32)
-        for c in self._ctrl.controllers:
-            c.social_costmap_t = t
+        self._ctrl.update_social_params(self.social_params)
+        self._ctrl.update_humans([tuple(a.pos) for a in self.agents])
 
     def _replan(self):
         if self._gf is None or self.social_cm is None:
@@ -529,8 +492,7 @@ class Sim:
 
         # 5. MPPI → robot kinematics
         state  = np.array([*self.robot_pos, self.robot_yaw], dtype=np.float32)
-        act, _ = self._ctrl.command(state, self.waypoints[self._wp_idx])
-        v, w   = float(act[0]), float(act[1])
+        v, w, _ = self._ctrl.step(state, self.waypoints[self._wp_idx])
         self.robot_pos[0] += self.SIM_DT * v * math.cos(self.robot_yaw)
         self.robot_pos[1] += self.SIM_DT * v * math.sin(self.robot_yaw)
         self.robot_yaw = math.atan2(
@@ -741,9 +703,6 @@ class Sim:
             elif aid == "llm":
                 icon, active = "🧠", self._llm_mode
                 col = C["green"] if self._llm_mode else C["dim"]
-            elif aid == "nn":
-                icon, active = "⚡", self._nn_mode
-                col = C["yellow"] if self._nn_mode else C["dim"]
             else:
                 icon, active, col = a["icon"], False, C["text"]
 
@@ -769,8 +728,7 @@ class Sim:
         elif self.running:
             d = float(np.linalg.norm(self.robot_pos - self.robot_goal))
             mode = (("🤖Auto " if self.auto_agents else "") +
-                    ("🧠LLM "  if self._llm_mode  else "") +
-                    ("⚡NN "   if self._nn_mode    else ""))
+                    ("🧠LLM "  if self._llm_mode  else ""))
             s, col = f"▶  {mode}t={self.t:.1f}s  dist={d:.2f}m  replans={self.n_replans}", C["robot"]
         else:
             s, col = "❙❙  PAUSED  —  press ▶ or Space", C["dim"]
@@ -780,7 +738,7 @@ class Sim:
         # right: social weight hint
         sw = self.fnt_sm.render(f"Social W: {self.social_w:.0f}  ( [ / ] )", True, C["dim"])
         self.screen.blit(sw, (WIN_W - sw.get_width() - 14, 4))
-        # LLM / NN status
+        # LLM status
         y_status = 20
         if self._llm_status:
             col_s = (C["green"] if "Updated" in self._llm_status
@@ -788,13 +746,6 @@ class Sim:
                      else C["red"])
             ls = self.fnt_sm.render(f"🧠 {self._llm_status}", True, col_s)
             self.screen.blit(ls, (WIN_W - ls.get_width() - 14, y_status))
-            y_status += 14
-        if self._nn_status:
-            col_n = (C["yellow"] if self._nn_status == "ready"
-                     else C["red"] if "error" in self._nn_status.lower() or "No " in self._nn_status
-                     else C["dim"])
-            ns = self.fnt_sm.render(f"⚡ {self._nn_status}", True, col_n)
-            self.screen.blit(ns, (WIN_W - ns.get_width() - 14, y_status))
 
     # ── 拖拽 ─────────────────────────────────────────────────────────────────
     def _try_start_drag(self, sx, sy) -> bool:
@@ -844,21 +795,12 @@ class Sim:
                     self.auto_agents = not self.auto_agents
                 elif aid == "llm":
                     self._llm_mode = not self._llm_mode
-                    self._nn_mode  = False   # mutually exclusive
                     if self._llm_mode:
                         self._llm_timer = 0.0
                     else:
                         self._llm_status = ""
                         for ag in self.agents: ag.llm_reason = ""
                         self._update_cm(force=True); self._sync_cm()
-                elif aid == "nn":
-                    self._nn_mode  = not self._nn_mode
-                    self._llm_mode = False   # mutually exclusive
-                    if self._nn_mode:
-                        self._nn_status = "loading…"
-                    else:
-                        self._nn_status = ""
-                    self._update_cm(force=True); self._sync_cm()
                 return
 
         if not in_map(sx, sy): return

@@ -666,7 +666,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Generate a top-down scene overview with humans and navigation info."
     )
     p.add_argument("--scene-xml",   type=Path, required=True)
-    p.add_argument("--layout-json", type=Path, default=None)
+    p.add_argument("--layout-json", type=Path, default=None,
+                   help="Deprecated alias for --scene-graph when the file is a HumanSSG scene graph")
+    p.add_argument("--scene-graph", type=Path, default=None)
     p.add_argument("--out",         type=Path, required=True)
     p.add_argument("--agent-radius", type=float, default=0.22)
     p.add_argument("--px-per-m",    type=int, default=200)
@@ -700,21 +702,29 @@ def main() -> None:
 
     viz = TopdownViz(smap, grid_free, grid_spacing, args.downscale)
 
-    # --- Humans from layout JSON ---
-    if args.layout_json is not None:
-        from experiments.social_nav.cost.llm_costmap import extract_scene
-        scene = extract_scene(args.layout_json)
+    # --- Humans from scene graph ---
+    scene_graph = args.scene_graph or args.layout_json
+    if scene_graph is not None:
+        from experiments.social_nav.cost.llm_costmap import build_entity_params, synthesize_costmap
+        from pipeline.scene_bridge import scene_graph_to_scene_description
+
+        scene = scene_graph_to_scene_description(scene_graph)
         viz.set_humans(scene.humans)
 
         if args.social_method != "none":
-            from experiments.social_nav.cost.llm_costmap import build_social_costmap
-            sc = build_social_costmap(
-                layout_json_path=args.layout_json,
-                scene_map=smap,
-                grid_shape=grid_free.shape,
-                downscale=args.downscale,
+            params, _ = build_entity_params(
+                scene,
                 method=args.social_method,
                 llm_model=args.llm_model,
+            )
+            occ = smap.occupancy
+            corners_px = np.array([[0, 0], [occ.shape[0] - 1, occ.shape[1] - 1]], dtype=float)
+            corners_m = smap.pos_px_to_m(corners_px)
+            sc = synthesize_costmap(
+                params,
+                grid_free.shape,
+                x_range=(float(min(corners_m[:, 0])), float(max(corners_m[:, 0]))),
+                y_range=(float(min(corners_m[:, 1])), float(max(corners_m[:, 1]))),
             )
             viz.set_social_costmap(sc)
 
