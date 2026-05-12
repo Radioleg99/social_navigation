@@ -42,16 +42,6 @@ class SceneDescription(NamedTuple):
 
 
 @dataclasses.dataclass
-class SocialCostRegion:
-    region_id: str
-    geometry_type: str
-    targets: list[str]
-    priority: str
-    parameters: dict
-    reason: str
-
-
-@dataclasses.dataclass
 class LLMPromptTemplates:
     layer1_system: str
     layer2_system: str
@@ -190,219 +180,319 @@ def rule_based_entity_params(scene: SceneDescription) -> list[SocialEntityParams
 
 _SOCIAL_REGION_SYSTEM = """\
 <system>
+
 <role>
-You are a social cost region generator for a mobile robot navigating an indoor top-down map.
+You are a social norm reasoning engine for a mobile robot navigating an indoor scene.
 
-Your task is NOT to generate a numeric costmap directly.
-Your task is to identify socially sensitive regions and describe them using a small set of geometric primitives.
+Your job has two semantic stages:
+  1. Detect which social regions exist in the scene.
+  2. Score each region by how socially harmful it would be for the robot to cross it,
+     after comparing all regions in the same scene.
 
-The robot will use these regions to build a 2D social costmap for A* planning.
+You do NOT generate coordinates, paths, A* parameters, or a pixel costmap.
+You DO generate one normalized social score per social region.
+The downstream geometry code turns each scored region into a 2D cost field.
 </role>
 
-<core_principle>
-Do not invent new geometry types.
-Do not output dense grids.
-Do not output free-form text outside JSON.
+<constraint_types>
 
-You should reason about social norms, but express the result only through the supported geometric primitives.
-</core_principle>
+personal_space
+  What it means: The personal space bubble around a person.
+                 The robot should not get too close.
+  When to use:   Every person, almost always.
+  Grounding:     Social Force Model (Helbing & Molnar 1995).
+                 Intensity controls the repulsion strength and radius.
 
-<supported_geometry_primitives>
+attention_cone
+  What it means: The region in front of a person where they are directing
+                 attention. The robot should not cross this line of focus.
+  When to use:   Person is watching, reading, working, cooking, or otherwise
+                 directing focused attention in a specific direction.
+  Grounding:     Proxemics (Hall 1966) front/back asymmetry.
+                 Intensity reflects how irreplaceable or sensitive the attention is.
 
-1. around_entity
-Use when the robot should avoid getting too close to one person or object.
-Typical use: personal space around a human.
+f_formation
+  What it means: The shared interaction space (o-space) of a conversation group.
+                 The robot should not cut through this space.
+  When to use:   Two or more people are talking, interacting, or marked as a group.
+  Grounding:     F-formation system (Kendon 1990).
+                 formation field: vis_a_vis | l_shape | side_by_side
+                 Intensity reflects how active and sensitive the interaction is.
 
-Required fields:
-- targets: one entity id
-- radius: meters
+</constraint_types>
 
-2. between_entities
-Use when the robot should avoid crossing the space between two entities.
-Typical use: two people talking, or a person interacting with an object.
+<scoring_scale>
+Score is RELATIVE to the current scene, not absolute.
+Always reason about all detected regions together before assigning scores.
 
-Required fields:
-- targets: two entity ids
-- width: meters
+Use both priority and score:
+  low      score 0.10-0.35  Minor social preference. Robot may pass through.
+  medium   score 0.36-0.60  Noticeable social cost. Prefer avoiding it.
+  high     score 0.61-0.85  Strong social cost. Avoid unless detour is large.
+  critical score 0.86-1.00  Almost never cross. Reserved for highly sensitive cases.
 
-3. front_sector
-Use when the robot should avoid passing directly in front of a person.
-Typical use: a person looking, watching, talking, working, or facing a direction.
+Key rule: scores must be globally calibrated.
+If one region is critical, weaker regions in the same scene should usually receive
+lower scores. Not everything can be high or critical.
+</scoring_scale>
 
-Required fields:
-- targets: one human id
-- radius: meters
-- angle_deg: degrees
+<reasoning_requirements>
+Your reasoning field must show:
+1. Per-entity analysis: what is this person doing, how engaged are they,
+   what regions apply, what score/priority and why.
+2. Global comparison: explicitly compare entities against each other.
+   Which constraint is most important in this scene? Which is least?
+3. Scoring implication: if two regions both have nonzero social cost, explain
+   which one is less harmful to cross and why.
 
-4. near_region
-Use when the robot should avoid a functional area around an entity.
-Typical use: kitchen counter, desk, TV area, doorway, narrow working area.
-
-Required fields:
-- targets: one or more entity ids
-- radius: meters
-
-</supported_geometry_primitives>
-
-<priority_scale>
-Use qualitative priority only.
-
-low:
-  weak social preference. Robot may pass through if needed.
-
-medium:
-  noticeable social preference. Robot should prefer avoiding it.
-
-high:
-  strong social preference. Robot should avoid it unless path becomes much longer.
-
-critical:
-  very strong social preference. Robot should almost never pass through it unless no alternative exists.
-
-Do not output numeric cost.
-</priority_scale>
+This reasoning is exposed for debugging. Be explicit and specific.
+Do not write generic statements. Reference the actual activity content.
+</reasoning_requirements>
 
 <decision_guidelines>
-- Every human should usually have at least one around_entity region unless clearly irrelevant.
-- If a person has a clear facing direction and is engaged in an activity, consider front_sector.
-- If two people are speaking, facing each other, or marked as a group, consider between_entities.
-- If a person is interacting with an object, consider between_entities or near_region.
-- If a person is idle, do not over-penalize the area; use low or medium priority.
-- If a person is talking, watching, working, cooking, or otherwise engaged, use higher priority.
-- Prefer fewer high-quality regions over many redundant regions.
-- Avoid duplicating the same social meaning with multiple overlapping regions unless necessary.
+- Every human should have at least personal_space.
+- If a person has a clear facing direction and focused activity, add attention_cone.
+- If people are in a group (marked by SPEAK/CONVERSATION edges, or clearly interacting),
+  add f_formation for the group.
+- A person can have multiple regions (e.g., personal_space + attention_cone).
+- Idle or walking persons: personal_space only, low or medium priority.
+- Talking, watching, working persons: higher score, consider attention_cone.
+- Use the activity text to infer engagement level. Specific context
+  (e.g., "world cup final", "important meeting") raises the score.
+- After detecting regions, assign scores by comparing all regions globally.
+- Do not assign the same score to everything. Differentiate.
 </decision_guidelines>
 
 <input_format>
-The input contains:
-- humans: id, position, yaw, activity
-- objects: id, category, position
-- groups: confirmed human-human interaction groups
-- robot: start and goal
-- optional notes
+{
+  "nodes": [
+    {
+      "node_id": "human_0",
+      "label": ["person"],
+      "bbox_center": [x, y, z],
+      "heading_deg": 0-360,
+      "activities": [
+        {
+          "name": "SPEAK | OBSERVE | WALK | SIT | ...",
+          "object": "target node id or empty",
+          "description": "free text describing what the person is doing and context"
+        }
+      ]
+    },
+    {"node_id": "object_0", "label": ["tv | table | ..."], "bbox_center": [x, y, z]}
+  ],
+  "edges": [
+    ["human_0", "human_1", {"relation": "SPEAK | OBSERVE | NEAR | ...", "desc": "short text", "description": "semantic relation text"}]
+  ],
+  "robot": {"start": [x, y], "goal": [x, y]}
+}
 </input_format>
 
 <output_format>
-Output valid JSON only.
+Output valid JSON only. No text outside the JSON block.
 
 {
-  "social_cost_regions": [
+  "reasoning": "step-by-step reasoning string (newlines allowed)",
+
+  "social_regions": [
     {
-      "region_id": "r1",
-      "geometry_type": "around_entity | between_entities | front_sector | near_region",
-      "targets": ["entity_id"],
-      "priority": "low | medium | high | critical",
-      "parameters": {
-        "radius": 1.0,
-        "width": 0.8,
-        "angle_deg": 90
-      },
-      "reason": "short reason, max 20 words"
+      "id": "r_human_0_personal",
+      "type": "personal_space",
+      "targets": ["human_0"],
+      "priority": "medium",
+      "score": 0.50,
+      "reason": "one sentence, specific to this person's activity"
+    },
+    {
+      "id": "r_human_0_attention",
+      "type": "attention_cone",
+      "targets": ["human_0"],
+      "priority": "high",
+      "score": 0.75,
+      "reason": "one sentence, specific to this person's attention and activity"
+    },
+    {
+      "id": "r_group_human_0_human_1",
+      "type": "f_formation",
+      "targets": ["human_0", "human_1"],
+      "formation": "vis_a_vis",
+      "priority": "low",
+      "score": 0.25,
+      "reason": "one sentence"
     }
-  ]
+  ],
+
+  "preferred_corridor": null
 }
+
+Rules:
+- social_regions is the only place for social constraints.
+- Valid region types: personal_space, attention_cone, f_formation.
+- Each region has id, type, targets, priority, score, reason.
+- score is a normalized social cost in [0, 1], calibrated after comparing all regions.
+- priority and score must agree: low=0.10-0.35, medium=0.36-0.60, high=0.61-0.85, critical=0.86-1.00.
+- f_formation regions must target at least two humans and may include formation:
+  vis_a_vis | l_shape | side_by_side.
+- personal_space and attention_cone regions usually target one human.
+- preferred_corridor is always null for Stage1. Do not omit the field.
+- Do not output any field not shown above.
 </output_format>
 
 <examples>
 
-<example>
+<example id="1">
 <input>
 {
-  "humans": [
-    {"id": "human_0", "position": [2.0, 2.0], "yaw_deg": 90, "activity": "watching_tv"}
+  "nodes": [
+    {"node_id": "human_0", "label": ["person"], "bbox_center": [2.0, 3.0, 0.9], "heading_deg": 90,
+     "activities": [{"name": "OBSERVE", "object": "object_0", "description": "watching tv, world cup final, visibly tense and focused"}]},
+    {"node_id": "human_1", "label": ["person"], "bbox_center": [5.0, 4.0, 0.9], "heading_deg": 270,
+     "activities": [{"name": "SPEAK", "object": "human_2", "description": "casual chat with friend"}]},
+    {"node_id": "human_2", "label": ["person"], "bbox_center": [6.2, 4.0, 0.9], "heading_deg": 90,
+     "activities": [{"name": "SPEAK", "object": "human_1", "description": "casual chat with friend"}]},
+    {"node_id": "object_0", "label": ["tv"], "bbox_center": [2.0, 7.0, 0.5]}
   ],
-  "objects": [
-    {"id": "tv_0", "category": "tv", "position": [2.0, 5.0]}
+  "edges": [
+    ["human_0", "object_0", {"relation": "OBSERVE", "desc": "person observe tv", "description": "World Cup final sightline"}],
+    ["human_1", "human_2", {"relation": "SPEAK", "desc": "person speak person", "description": "casual chat"}]
   ],
-  "groups": [],
-  "robot": {"start": [0.5, 0.5], "goal": [4.5, 5.5]}
+  "robot": {"start": [0.0, 2.0], "goal": [8.0, 4.0]}
 }
 </input>
 <output>
 {
-  "social_cost_regions": [
+  "reasoning": "human_0 is watching the World Cup final — this is a high-stakes, time-sensitive activity with intense focus. Interrupting the sight line is essentially irreversible mid-match. This is the strongest constraint in the scene.\nhuman_1 and human_2 are having a casual chat. Casual conversations can naturally pause without social harm. Their f_formation o-space has low sensitivity.\nGlobal comparison: human_0's attention_cone is critical; human_1/2's f_formation is low. The robot path toward the goal will likely pass near human_1/2 — passing between them is socially preferable to crossing human_0's sight line.",
+
+  "social_regions": [
     {
-      "region_id": "r1",
-      "geometry_type": "around_entity",
-      "targets": ["human_0"],
-      "priority": "medium",
-      "parameters": {"radius": 0.9},
-      "reason": "basic personal space around the seated person"
-    },
-    {
-      "region_id": "r2",
-      "geometry_type": "between_entities",
-      "targets": ["human_0", "tv_0"],
-      "priority": "critical",
-      "parameters": {"width": 0.8},
-      "reason": "robot should not cross the person's viewing space"
-    },
-    {
-      "region_id": "r3",
-      "geometry_type": "front_sector",
+      "id": "r_human_0_personal",
+      "type": "personal_space",
       "targets": ["human_0"],
       "priority": "high",
-      "parameters": {"radius": 1.5, "angle_deg": 90},
-      "reason": "passing directly in front may interrupt attention"
+      "score": 0.72,
+      "reason": "watching World Cup final — sight line must not be crossed"
+    },
+    {
+      "id": "r_human_0_attention",
+      "type": "attention_cone",
+      "targets": ["human_0"],
+      "priority": "critical",
+      "score": 0.96,
+      "reason": "watching World Cup final — sight line must not be crossed"
+    },
+    {
+      "id": "r_human_1_personal",
+      "type": "personal_space",
+      "targets": ["human_1"],
+      "priority": "low",
+      "score": 0.22,
+      "reason": "casual conversation, low engagement level"
+    },
+    {
+      "id": "r_human_2_personal",
+      "type": "personal_space",
+      "targets": ["human_2"],
+      "priority": "low",
+      "score": 0.22,
+      "reason": "casual conversation, low engagement level"
+    },
+    {
+      "id": "r_group_human_1_human_2",
+      "type": "f_formation",
+      "targets": ["human_1", "human_2"],
+      "formation": "vis_a_vis",
+      "priority": "low",
+      "score": 0.30,
+      "reason": "casual chat, can be briefly interrupted without social harm"
     }
-  ]
+  ],
+
+  "preferred_corridor": null
 }
 </output>
 </example>
 
-<example>
+<example id="2">
 <input>
 {
-  "humans": [
-    {"id": "human_0", "position": [1.0, 2.0], "yaw_deg": 0, "activity": "speaking"},
-    {"id": "human_1", "position": [2.5, 2.0], "yaw_deg": 180, "activity": "listening"}
+  "nodes": [
+    {"node_id": "human_0", "label": ["person"], "bbox_center": [1.0, 2.0, 0.9], "heading_deg": 0,
+     "activities": [{"name": "SPEAK", "object": "human_1", "description": "speaking in a group meeting, presenting slides"}]},
+    {"node_id": "human_1", "label": ["person"], "bbox_center": [3.0, 1.5, 0.9], "heading_deg": 180,
+     "activities": [{"name": "OBSERVE", "object": "human_0", "description": "listening to presentation, taking notes"}]},
+    {"node_id": "human_2", "label": ["person"], "bbox_center": [3.0, 2.5, 0.9], "heading_deg": 180,
+     "activities": [{"name": "OBSERVE", "object": "human_0", "description": "listening to presentation"}]}
   ],
-  "objects": [],
-  "groups": [["human_0", "human_1"]],
-  "robot": {"start": [0.0, 2.0], "goal": [4.0, 2.0]}
+  "edges": [
+    ["human_0", "human_1", {"relation": "SPEAK", "desc": "presenter addresses listener", "description": "formal meeting in progress"}],
+    ["human_0", "human_2", {"relation": "SPEAK", "desc": "presenter addresses listener", "description": "formal meeting in progress"}]
+  ],
+  "robot": {"start": [0.0, 5.0], "goal": [5.0, 0.0]}
 }
 </input>
 <output>
 {
-  "social_cost_regions": [
+  "reasoning": "All three people are in an active meeting. human_0 is presenting — this is a high-focus activity and their attention_cone (toward the audience) should not be disrupted. human_1 and human_2 are actively listening and taking notes — this is a formal context. The entire group interaction space is sensitive.\nGlobal comparison: the meeting is the dominant constraint in the scene. All intensities are high or above. The robot should route around the entire meeting group.",
+
+  "social_regions": [
     {
-      "region_id": "r1",
-      "geometry_type": "around_entity",
+      "id": "r_human_0_personal",
+      "type": "personal_space",
       "targets": ["human_0"],
-      "priority": "medium",
-      "parameters": {"radius": 0.9},
-      "reason": "basic personal space around a speaking person"
+      "priority": "high",
+      "score": 0.72,
+      "reason": "presenting in a meeting, active speaker"
     },
     {
-      "region_id": "r2",
-      "geometry_type": "around_entity",
+      "id": "r_human_0_attention",
+      "type": "attention_cone",
+      "targets": ["human_0"],
+      "priority": "high",
+      "score": 0.84,
+      "reason": "presenting in a meeting, active speaker"
+    },
+    {
+      "id": "r_human_1_personal",
+      "type": "personal_space",
       "targets": ["human_1"],
       "priority": "medium",
-      "parameters": {"radius": 0.9},
-      "reason": "basic personal space around a listening person"
+      "score": 0.52,
+      "reason": "actively listening and taking notes"
     },
     {
-      "region_id": "r3",
-      "geometry_type": "between_entities",
-      "targets": ["human_0", "human_1"],
-      "priority": "critical",
-      "parameters": {"width": 0.9},
-      "reason": "robot should not pass through an active conversation"
+      "id": "r_human_2_personal",
+      "type": "personal_space",
+      "targets": ["human_2"],
+      "priority": "medium",
+      "score": 0.48,
+      "reason": "actively listening to presentation"
+    },
+    {
+      "id": "r_group_human_0_human_1_human_2",
+      "type": "f_formation",
+      "targets": ["human_0", "human_1", "human_2"],
+      "formation": "vis_a_vis",
+      "priority": "high",
+      "score": 0.82,
+      "reason": "formal meeting in progress, group space should not be disrupted"
     }
-  ]
+  ],
+
+  "preferred_corridor": null
 }
 </output>
 </example>
 
 </examples>
+
 </system>
 """
 
 
 def get_default_prompt_templates() -> LLMPromptTemplates:
     return LLMPromptTemplates(
-                layer1_system=_SOCIAL_REGION_SYSTEM,
-                layer2_system="",
+        layer1_system=_SOCIAL_REGION_SYSTEM,
+        layer2_system="",
     )
 
 
@@ -413,7 +503,7 @@ def build_social_region_prompt(
     """Build social region prompt from scene payload.
     
     Args:
-        scene_payload: Dictionary with humans, objects, groups, robot, and optional notes
+        scene_payload: Dictionary with HumanSSG-style nodes, edges, robot, and optional notes
         system_prompt: Optional custom system prompt (defaults to _SOCIAL_REGION_SYSTEM)
     
     Returns:
@@ -426,20 +516,29 @@ def build_social_region_prompt(
     )
 
 
-def _parse_social_regions(response: str) -> list[SocialCostRegion]:
-    """Parse LLM response into list of SocialCostRegion objects.
-    
-    Extracts JSON from response, validates geometry types and priorities,
-    and returns only valid regions.
-    
-    Args:
-        response: LLM response string (may contain extra text)
-    
-    Returns:
-        List of validated SocialCostRegion objects
-    
-    Raises:
-        ValueError: If no valid JSON found in response
+_INTENSITY_TO_SCORE: dict[str, float] = {"low": 0.25, "medium": 0.50, "high": 0.75, "critical": 0.95}
+_INTENSITY_TO_PS:    dict[str, float] = {"low": 0.70, "medium": 0.90, "high": 1.20, "critical": 1.50}
+_INTENSITY_TO_OS:    dict[str, float] = {"low": 1.30, "medium": 1.80, "high": 2.50, "critical": 3.50}
+
+
+_REGION_TYPE_ALIASES: dict[str, str] = {
+    "sfm_personal_space": "personal_space",
+    "personal_space": "personal_space",
+    "attention_cone": "attention_cone",
+    "f_formation": "f_formation",
+}
+
+
+def _parse_social_regions(response: str) -> tuple[str, list[dict], object]:
+    """Parse LLM response into (reasoning, social_regions, preferred_corridor).
+
+    Preferred format:
+      {"social_regions": [{"id": "...", "type": "...", "targets": [...],
+                           "priority": "low|medium|high|critical",
+                           "score": 0.0-1.0, ...}]}
+
+    The previous annotations format is still accepted and normalized to
+    social_regions so old saved prompts fail softly instead of breaking the UI.
     """
     start = response.find("{")
     end = response.rfind("}") + 1
@@ -447,50 +546,82 @@ def _parse_social_regions(response: str) -> list[SocialCostRegion]:
         raise ValueError(f"No JSON in LLM response: {response[:200]}")
 
     data = json.loads(response[start:end])
-    regions = []
+    reasoning = str(data.get("reasoning", ""))
+    preferred_corridor = data.get("preferred_corridor", None)
 
-    allowed_geometry = {"around_entity", "between_entities", "front_sector", "near_region"}
-    allowed_priority = {"low", "medium", "high", "critical"}
+    allowed_priorities = {"low", "medium", "high", "critical"}
 
-    for r in data.get("social_cost_regions", []):
+    def norm_type(raw: object) -> str | None:
+        return _REGION_TYPE_ALIASES.get(str(raw or "").strip().lower())
+
+    def norm_priority(raw: object) -> str | None:
+        value = str(raw or "").strip().lower()
+        return value if value in allowed_priorities else None
+
+    def norm_score(raw: object) -> float | None:
+        if raw is None:
+            return None
         try:
-            geometry_type = str(r["geometry_type"])
-            priority = str(r["priority"])
-            targets = list(r["targets"])
-        except (KeyError, TypeError, ValueError):
+            return float(np.clip(float(raw), 0.0, 1.0))
+        except (TypeError, ValueError):
+            return None
+
+    valid: list[dict] = []
+    for i, region in enumerate(data.get("social_regions", [])):
+        r_type = norm_type(region.get("type") or region.get("region_type"))
+        priority = norm_priority(region.get("priority") or region.get("intensity"))
+        targets = region.get("targets", [])
+        if isinstance(targets, str):
+            targets = [targets]
+        targets = [str(t) for t in targets]
+        if not r_type or not priority or not targets:
             continue
-
-        if geometry_type not in allowed_geometry:
+        if r_type == "f_formation" and len(targets) < 2:
             continue
-        if priority not in allowed_priority:
+        valid.append({
+            "id": str(region.get("id") or region.get("region_id") or f"r{i}"),
+            "type": r_type,
+            "targets": targets,
+            "priority": priority,
+            "score": norm_score(region.get("score")),
+            "formation": str(region.get("formation", "vis_a_vis")),
+            "reason": str(region.get("reason", "")),
+        })
+
+    if valid:
+        return reasoning, valid, preferred_corridor
+
+    # Backward compatibility: annotations -> social_regions.
+    for ann_i, ann in enumerate(data.get("annotations", [])):
+        ann_targets: list[str] = []
+        if "entity" in ann:
+            ann_targets = [str(ann["entity"])]
+        elif "group" in ann:
+            ann_targets = [str(m) for m in ann.get("group", [])]
+        if not ann_targets:
             continue
+        for c_i, constraint in enumerate(ann.get("constraints", [])):
+            r_type = norm_type(constraint.get("type"))
+            priority = norm_priority(constraint.get("intensity") or constraint.get("priority"))
+            if not r_type or not priority:
+                continue
+            if r_type == "f_formation" and len(ann_targets) < 2:
+                continue
+            valid.append({
+                "id": f"legacy_{ann_i}_{c_i}",
+                "type": r_type,
+                "targets": ann_targets,
+                "priority": priority,
+                "score": norm_score(constraint.get("score")),
+                "formation": str(constraint.get("formation", "vis_a_vis")),
+                "reason": str(ann.get("reason", "")),
+            })
 
-        region_id = str(r.get("region_id", f"r{len(regions) + 1}"))
-        parameters = r.get("parameters", {})
-        if not isinstance(parameters, dict):
-            parameters = {}
-
-        regions.append(SocialCostRegion(
-            region_id=region_id,
-            geometry_type=geometry_type,
-            targets=[str(target) for target in targets],
-            priority=priority,
-            parameters=dict(parameters),
-            reason=str(r.get("reason", "")),
-        ))
-
-    return regions
+    return reasoning, valid, preferred_corridor
 
 # ---------------------------------------------------------------------------
 # Scene → social regions → SocialEntityParams
 # ---------------------------------------------------------------------------
-
-def get_default_prompt_templates() -> LLMPromptTemplates:
-    return LLMPromptTemplates(
-        layer1_system=_SOCIAL_REGION_SYSTEM,
-        layer2_system="",
-    )
-
 
 def _scene_to_social_payload(
     scene: SceneDescription,
@@ -498,29 +629,55 @@ def _scene_to_social_payload(
     robot_goal: tuple[float, float] | None = None,
     notes: str | None = None,
 ) -> dict:
-    humans = [
-        {
-            "id": f"human_{i}",
-            "position": [float(h.pos[0]), float(h.pos[1])],
-            "yaw_deg": float(h.yaw_deg),
-            "activity": "_".join(act.lower() for act in h.activities) if h.activities else "idle",
+    def activity_to_dict(raw: str) -> dict:
+        name, _, _ = str(raw).partition(":")
+        name = name.strip().split(" ", 1)[0].upper() or "ACTIVITY"
+        return {
+            "name": name,
+            "object": "",
+            "description": str(raw),
         }
-        for i, h in enumerate(scene.humans)
-    ]
-    objects = [
-        {
-            "id": f"object_{i}",
-            "category": o.category,
-            "position": [float(o.pos[0]), float(o.pos[1])],
-        }
-        for i, o in enumerate(scene.obstacles)
-    ]
-    groups = [[f"human_{idx}" for idx in group if 0 <= idx < len(scene.humans)] for group in scene.groups]
-    groups = [group for group in groups if len(group) >= 2]
+
+    nodes: list[dict] = []
+    for i, h in enumerate(scene.humans):
+        activities = [activity_to_dict(act) for act in h.activities] if h.activities else [
+            {"name": "IDLE", "object": "", "description": "idle"}
+        ]
+        nodes.append({
+            "node_id": f"human_{i}",
+            "label": ["person"],
+            "bbox_center": [float(h.pos[0]), float(h.pos[1]), 0.0],
+            "heading_deg": float(h.yaw_deg),
+            "activities": activities,
+        })
+
+    for i, o in enumerate(scene.obstacles):
+        nodes.append({
+            "node_id": f"object_{i}",
+            "label": [str(o.category).lower()],
+            "bbox_center": [float(o.pos[0]), float(o.pos[1]), 0.0],
+        })
+
+    edges: list[list[object]] = []
+    for group in scene.groups:
+        members = [f"human_{idx}" for idx in group if 0 <= idx < len(scene.humans)]
+        if len(members) < 2:
+            continue
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                edges.append([
+                    members[i],
+                    members[j],
+                    {
+                        "relation": "CONVERSATION",
+                        "desc": "confirmed conversation group",
+                        "description": "these people are interacting and share an f-formation space",
+                    },
+                ])
+
     payload: dict[str, object] = {
-        "humans": humans,
-        "objects": objects,
-        "groups": groups,
+        "nodes": nodes,
+        "edges": edges,
     }
     robot: dict[str, list[float]] = {}
     if robot_pos is not None:
@@ -532,14 +689,6 @@ def _scene_to_social_payload(
     if notes:
         payload["notes"] = notes
     return payload
-
-
-def _priority_to_score(priority: str) -> float:
-    return {"low": 0.25, "medium": 0.50, "high": 0.78, "critical": 0.95}[priority]
-
-
-def _default_radius(priority: str) -> float:
-    return {"low": 0.7, "medium": 0.9, "high": 1.2, "critical": 1.5}[priority]
 
 
 def _lookup_scene_entity(scene: SceneDescription, target_id: str) -> tuple[str, int, tuple[float, float], float] | None:
@@ -560,7 +709,7 @@ def _lookup_scene_entity(scene: SceneDescription, target_id: str) -> tuple[str, 
     return None
 
 
-def _merge_social_entity_params(base: SocialEntityParams, other: SocialEntityParams) -> SocialEntityParams:
+def _merge_entity_params(base: SocialEntityParams, other: SocialEntityParams) -> SocialEntityParams:
     base.score = max(base.score, other.score)
     base.personal_space = max(base.personal_space, other.personal_space)
     base.orientation_sensitivity = max(base.orientation_sensitivity, other.orientation_sensitivity)
@@ -571,97 +720,111 @@ def _merge_social_entity_params(base: SocialEntityParams, other: SocialEntityPar
     return base
 
 
-def _regions_to_entity_params(scene: SceneDescription, regions: list[SocialCostRegion]) -> list[SocialEntityParams]:
+def _region_score(region: dict) -> float:
+    score = region.get("score")
+    if score is not None:
+        try:
+            return float(np.clip(float(score), 0.0, 1.0))
+        except (TypeError, ValueError):
+            pass
+    return _INTENSITY_TO_SCORE[region.get("priority", "medium")]
+
+
+def _social_regions_to_entity_params(scene: SceneDescription, regions: list[dict]) -> list[SocialEntityParams]:
+    """Convert social_regions → SocialEntityParams list.
+
+    personal_space → per-entity score + personal_space radius
+    attention_cone → higher orientation_sensitivity (directional front bias)
+    f_formation    → extra midpoint entity for group o-space
+    """
     params_by_id: dict[str, SocialEntityParams] = {}
     extra_params: list[SocialEntityParams] = []
 
     for region in regions:
-        score = _priority_to_score(region.priority)
-        radius = float(region.parameters.get("radius", _default_radius(region.priority)))
-        width = float(region.parameters.get("width", radius))
-        angle_deg = float(region.parameters.get("angle_deg", 90.0))
-        targets = [str(target) for target in region.targets]
+        reason = region.get("reason", "")
+        r_type = region.get("type", "")
+        priority = region.get("priority", "medium")
+        targets = [str(t) for t in region.get("targets", [])]
 
-        if region.geometry_type == "between_entities" and len(targets) >= 2:
-            first = _lookup_scene_entity(scene, targets[0])
-            second = _lookup_scene_entity(scene, targets[1])
-            if first is None or second is None:
+        if r_type in {"personal_space", "attention_cone"}:
+            if not targets:
                 continue
-            x = (first[2][0] + second[2][0]) / 2.0
-            y = (first[2][1] + second[2][1]) / 2.0
-            yaw = math.degrees(math.atan2(second[2][1] - first[2][1], second[2][0] - first[2][0]))
-            extra_params.append(SocialEntityParams(
-                entity_id=region.region_id,
-                pos=(x, y),
-                yaw_deg=yaw,
-                score=score,
-                personal_space=max(width, 0.6),
-                orientation_sensitivity=1.0,
-                sigma_perp=max(0.45, width * 0.7),
-                reason=region.reason,
-            ))
-            continue
-
-        if region.geometry_type == "near_region" and len(targets) > 1:
-            lookup = [_lookup_scene_entity(scene, target) for target in targets]
-            lookup = [item for item in lookup if item is not None]
-            if not lookup:
-                continue
-            x = sum(item[2][0] for item in lookup) / len(lookup)
-            y = sum(item[2][1] for item in lookup) / len(lookup)
-            yaw = lookup[0][3]
-            extra_params.append(SocialEntityParams(
-                entity_id=region.region_id,
-                pos=(x, y),
-                yaw_deg=yaw,
-                score=score,
-                personal_space=radius,
-                orientation_sensitivity=1.0,
-                sigma_perp=max(0.5, radius),
-                reason=region.reason,
-            ))
-            continue
-
-        for target in targets[:1]:
-            entity = _lookup_scene_entity(scene, target)
+            entity = _lookup_scene_entity(scene, targets[0])
             if entity is None:
                 continue
             kind, index, pos, yaw = entity
-            entity_id = f"person_{index}" if kind == "human" else f"object_{index}"
-            orientation_sensitivity = 1.0
-            sigma_perp = None
-            if region.geometry_type == "front_sector":
-                orientation_sensitivity = 1.8
-                sigma_perp = max(0.45, radius * 0.5)
-            elif region.geometry_type == "near_region":
-                sigma_perp = max(0.5, radius * 0.9)
-            elif region.geometry_type == "around_entity":
-                sigma_perp = max(0.5, radius * 0.85)
+            param_id = f"person_{index}" if kind == "human" else f"object_{index}"
 
-            new_param = SocialEntityParams(
-                entity_id=entity_id,
-                pos=pos,
-                yaw_deg=yaw,
-                score=score,
-                personal_space=radius,
-                orientation_sensitivity=orientation_sensitivity,
-                sigma_perp=sigma_perp,
-                reason=region.reason,
+            score = _region_score(region)
+            ps = _INTENSITY_TO_PS[priority]
+            os_val = 1.3
+            sigma_perp = ps * 0.85
+            if r_type == "attention_cone":
+                os_val = _INTENSITY_TO_OS[priority]
+                sigma_perp = ps * 0.45  # narrow perpendicular; cone is focused
+
+            new_p = SocialEntityParams(
+                entity_id=param_id, pos=pos, yaw_deg=yaw,
+                score=score, personal_space=ps,
+                orientation_sensitivity=os_val, sigma_perp=sigma_perp,
+                reason=reason,
             )
-            if entity_id in params_by_id:
-                params_by_id[entity_id] = _merge_social_entity_params(params_by_id[entity_id], new_param)
+            if param_id in params_by_id:
+                params_by_id[param_id] = _merge_entity_params(params_by_id[param_id], new_p)
             else:
-                params_by_id[entity_id] = new_param
+                params_by_id[param_id] = new_p
+
+        elif r_type == "f_formation":
+            entities = [e for m in targets if (e := _lookup_scene_entity(scene, m)) is not None]
+            if len(entities) < 2:
+                continue
+
+            xs = [e[2][0] for e in entities]
+            ys = [e[2][1] for e in entities]
+            mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+            yaw_axis = math.degrees(math.atan2(
+                entities[1][2][1] - entities[0][2][1],
+                entities[1][2][0] - entities[0][2][0],
+            ))
+
+            formation = region.get("formation", "vis_a_vis")
+            score = _region_score(region)
+            ps = _INTENSITY_TO_PS[priority]
+            avg_dist = math.hypot(
+                entities[-1][2][0] - entities[0][2][0],
+                entities[-1][2][1] - entities[0][2][1],
+            ) / max(len(entities) - 1, 1)
+
+            if formation == "vis_a_vis":
+                sp_along = avg_dist / 2 + ps * 0.50
+                sp_perp  = ps * 0.60
+            elif formation == "side_by_side":
+                sp_along = ps * 0.80
+                sp_perp  = avg_dist / 2 + ps * 0.50
+            else:  # l_shape
+                sp_along = avg_dist / 2 + ps * 0.40
+                sp_perp  = ps * 0.70
+
+            group_id = str(region.get("id") or ("group_" + "_".join(targets)))
+            extra_params.append(SocialEntityParams(
+                entity_id=group_id, pos=(mx, my), yaw_deg=yaw_axis,
+                score=score, personal_space=sp_along,
+                orientation_sensitivity=1.0, sigma_perp=sp_perp,
+                reason=reason,
+            ))
 
     return list(params_by_id.values()) + extra_params
 
 
-def _format_log(regions: list[SocialCostRegion], params: list[SocialEntityParams]) -> str:
-    lines = ["=== SOCIAL COST REGIONS ==="]
+def _format_log(reasoning: str, regions: list[dict], params: list[SocialEntityParams]) -> str:
+    lines = ["=== LLM REASONING ===", reasoning, "", "=== SOCIAL REGIONS ==="]
     for region in regions:
-        lines.append(f"  [{region.region_id}] {region.geometry_type}  priority={region.priority}")
-        lines.append(f"    targets={region.targets}")
-        lines.append(f"    {region.reason}")
+        lines.append(
+            f"  {region.get('id', '')}  {region.get('type')}:{region.get('priority')} "
+            f"score={_region_score(region):.2f}  "
+            f"targets={region.get('targets', [])}"
+        )
+        lines.append(f"    {region.get('reason', '')}")
     lines += ["", "=== ENTITY PARAMS ==="]
     for p in params:
         lines.append(f"  {p.entity_id}  score={p.score:.2f}  ps={p.personal_space:.1f}m  os={p.orientation_sensitivity:.1f}x")
@@ -669,16 +832,22 @@ def _format_log(regions: list[SocialCostRegion], params: list[SocialEntityParams
     return "\n".join(lines)
 
 
-def _print_reasoning(regions: list[SocialCostRegion], params: list[SocialEntityParams]) -> None:
+def _print_reasoning(reasoning: str, regions: list[dict], params: list[SocialEntityParams]) -> None:
     sep = "─" * 60
     print(f"\n{sep}")
-    print("SOCIAL COST REGIONS")
+    print("LLM REASONING")
+    print(sep)
+    print(reasoning)
+    print(f"\n{sep}")
+    print("SOCIAL REGIONS")
     print(sep)
     for region in regions:
-        print(f"  [{region.region_id}] {region.geometry_type}  priority={region.priority}")
-        print(f"    targets={region.targets}")
-        print(f"    {region.reason}")
-
+        print(
+            f"  {region.get('id', '')}  {region.get('type')}  priority={region.get('priority')}  "
+            f"score={_region_score(region):.2f}  "
+            f"targets={region.get('targets', [])}"
+        )
+        print(f"    → {region.get('reason', '')}")
     print(f"\n{sep}")
     print("PER-ENTITY PARAMS")
     print(sep)
@@ -713,18 +882,18 @@ class SocialCostOrchestrator:
     ) -> tuple[list[SocialEntityParams], str]:
         payload = _scene_to_social_payload(scene, robot_pos, robot_goal)
         resp = _call_llm(build_social_region_prompt(payload, self._system_prompt), self._model)
-        regions = _parse_social_regions(resp)
+        reasoning, regions, _ = _parse_social_regions(resp)
         if not regions:
             params = rule_based_entity_params(scene)
-            llm_log = "=== SOCIAL COST REGIONS ===\n  (none parsed; fell back to rule-based params)"
+            llm_log = "=== SOCIAL REGIONS ===\n  (none parsed; fell back to rule-based params)"
             if self._verbose:
-                print("[llm_costmap] no valid social regions parsed, using rule-based fallback")
+                print("[llm_costmap] no valid social_regions parsed, using rule-based fallback")
             return params, llm_log
-        params = _regions_to_entity_params(scene, regions)
-        llm_log = _format_log(regions, params)
+        params = _social_regions_to_entity_params(scene, regions)
+        llm_log = _format_log(reasoning, regions, params)
 
         if self._verbose:
-            _print_reasoning(regions, params)
+            _print_reasoning(reasoning, regions, params)
 
         return params, llm_log
 

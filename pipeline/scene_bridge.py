@@ -12,12 +12,12 @@ HumanSSG graph format (from extract_json.py):
                 "label": ["person" | "chair" | ...],
                 "bbox_center": [x, y, z],   # 3DSG coordinate frame
                 "bbox_extent": [ex, ey, ez],
-                "activities": [{"name": str, "object": str}],  # humans only
+                "activities": [{"name": str, "object": str, "description": str}],  # humans only
                 "heading_deg": float,        # optional, humans only
             }
         ],
         "edges": [
-            [id1, id2, {"desc": str, "relation": str}]
+            [id1, id2, {"desc": str, "relation": str, "description": str}]
         ]
     }
 
@@ -42,7 +42,7 @@ import numpy as np
 class HumanInfo(NamedTuple):
     pos: tuple[float, float]    # (x, y) in MuJoCo world frame (metres)
     yaw_deg: float              # heading, 0=+x, 90=+y
-    activities: list[str]       # raw activity names from scene graph, e.g. ["SPEAK", "OBSERVE"]
+    activities: list[str]       # activity names plus optional descriptions from nodes/edges
     state: str                  # idle | sitting | walking | talking
 
 
@@ -114,6 +114,60 @@ def _infer_human_state(activities: list[str], node: dict) -> str:
     return "idle"
 
 
+def _node_label(nodes_by_id: dict[int, dict], node_id: int) -> str:
+    node = nodes_by_id.get(node_id, {})
+    labels = node.get("label", [])
+    return str(labels[0]) if labels else "unknown"
+
+
+def _activity_entries(node: dict) -> list[str]:
+    entries: list[str] = []
+    for act in node.get("activities", []):
+        if not isinstance(act, dict):
+            continue
+        name = str(act.get("name", "")).upper()
+        if not name:
+            continue
+        entries.append(name)
+        details: list[str] = []
+        obj = str(act.get("object", "") or "")
+        desc = str(act.get("description", "") or act.get("desc", "") or "")
+        if obj:
+            details.append(f"object={obj}")
+        if desc:
+            details.append(desc)
+        if details:
+            entries.append(f"{name}: " + "; ".join(details))
+    return entries
+
+
+def _edge_activity_notes(
+    edges: list,
+    person_nodes: dict[int, dict],
+    nodes_by_id: dict[int, dict],
+) -> dict[int, list[str]]:
+    notes: dict[int, list[str]] = {nid: [] for nid in person_nodes}
+    for edge in edges:
+        if len(edge) < 3:
+            continue
+        try:
+            src, dst = int(edge[0]), int(edge[1])
+        except (TypeError, ValueError):
+            continue
+        meta = edge[2] if isinstance(edge[2], dict) else {}
+        relation = str(meta.get("relation", "") or "").upper()
+        desc = str(meta.get("description", "") or meta.get("desc", "") or "")
+        if not relation and not desc:
+            continue
+        if src in notes:
+            target_label = _node_label(nodes_by_id, dst)
+            note = f"EDGE {relation or 'RELATION'} to node_{dst}({target_label})"
+            if desc:
+                note += f": {desc}"
+            notes[src].append(note)
+    return notes
+
+
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
@@ -147,6 +201,7 @@ def scene_graph_to_scene_description(
 
     nodes: list[dict] = graph.get("nodes", [])
     edges: list = graph.get("edges", [])
+    nodes_by_id = {int(node.get("node_id", -1)): node for node in nodes}
 
     # ------------------------------------------------------------------
     # 1. Separate person nodes from obstacle nodes
@@ -170,6 +225,8 @@ def scene_graph_to_scene_description(
     humans: list[HumanInfo] = []
     node_id_to_human_idx: dict[int, int] = {}
 
+    edge_notes = _edge_activity_notes(edges, person_nodes, nodes_by_id)
+
     for nid, node in sorted(person_nodes.items()):
         bbox_center = node.get("bbox_center", [0.0, 0.0, 0.0])
         x, y = _apply_transform(bbox_center, coord_transform)
@@ -177,8 +234,8 @@ def scene_graph_to_scene_description(
         # Heading: use stored value if available, otherwise 0
         yaw_deg = float(node.get("heading_deg", 0.0))
 
-        raw_activities: list[dict] = node.get("activities", [])
-        activities = [act.get("name", "").upper() for act in raw_activities if act.get("name")]
+        activities = _activity_entries(node)
+        activities.extend(edge_notes.get(nid, []))
         state = _infer_human_state(activities, node)
 
         idx = len(humans)
