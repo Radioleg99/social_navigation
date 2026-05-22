@@ -84,6 +84,7 @@ _ACTIVITY_SCORE: dict[str, float] = {
     "speak": 0.9, "talk": 0.9, "talking": 0.9, "conversation": 0.9, "chat": 0.9,
     "observe": 0.7, "gesture": 0.7, "waving": 0.7,
     "sit": 0.6, "sitting": 0.6,
+    "sleep": 0.35, "sleeping": 0.35,
     "walk": 0.7, "walking": 0.7, "running": 0.7,
     "idle": 0.5, "standing": 0.5, "standing_idle": 0.5,
 }
@@ -91,6 +92,7 @@ _ACTIVITY_PS: dict[str, float] = {
     "speak": 1.2, "talk": 1.2, "talking": 1.2, "conversation": 1.2, "chat": 1.2,
     "observe": 1.0, "gesture": 1.0, "waving": 1.0,
     "sit": 0.9, "sitting": 0.9,
+    "sleep": 0.7, "sleeping": 0.7,
     "walk": 1.1, "walking": 1.1, "running": 1.1,
     "idle": 0.8, "standing": 0.8, "standing_idle": 0.8,
 }
@@ -98,6 +100,7 @@ _ACTIVITY_OS: dict[str, float] = {
     "speak": 2.5, "talk": 2.5, "talking": 2.5, "conversation": 2.5, "chat": 2.5,
     "observe": 2.0, "gesture": 1.8, "waving": 1.8,
     "sit": 1.5, "sitting": 1.5,
+    "sleep": 1.1, "sleeping": 1.1,
     "walk": 1.8, "walking": 1.8, "running": 1.8,
     "idle": 1.3, "standing": 1.3, "standing_idle": 1.3,
 }

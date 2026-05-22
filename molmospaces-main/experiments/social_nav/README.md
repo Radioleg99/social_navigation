@@ -30,6 +30,40 @@ Primary entrypoints:
   --scene-graph outputs/procthor/train_9/scene_graph.json
 ```
 
+Stage2 scripted playback inside the same playground:
+
+```bash
+make playground-stage2
+```
+
+Available scripted timelines:
+`conversation_crossing`, `argument_block`, `tv_watchers`, `sleeper_and_walker`,
+and `queue_split`. Select one at launch with:
+
+```bash
+make playground-stage2 STAGE2_SCENARIO=argument_block
+```
+
+Press `N` inside the playground to cycle timelines.
+
+or explicitly:
+
+```bash
+./.venv/bin/python experiments/social_nav/stage1_playground.py \
+  --stage2-scripted \
+  --stage2-scenario conversation_crossing \
+  --map-source scene-xml \
+  --background rgb \
+  --layout-json outputs/procthor/train_9/train_9_layout.json \
+  --scene-graph outputs/procthor/train_9/scene_graph.json \
+  --start-pose 2.0,4.0,0.0 \
+  --goal-xy 9.0,4.0 \
+  --birdview-downscale 6 \
+  --stage2-mppi-horizon 32 \
+  --stage2-replan-interval 0.0 \
+  --stage2-costmap-interval 0.5
+```
+
 Use `--social-method llm --llm-model <model>` only when you explicitly want to
 spend an API call. The default interactive workflow uses rule-based social cost
 and only refreshes LLM cost when requested.
@@ -46,10 +80,26 @@ Primary entrypoint:
 ./.venv/bin/python experiments/social_nav/run_stage2_dynamic.py
 ```
 
-The Stage2 simulator updates human positions and relationships, regenerates
-the deterministic social costmap in real time, replans A*, and tracks the route
-with MPPI. LLM mode can be toggled in the UI; if the API call is unavailable,
-the shared rule-based costmap is used as a fallback.
+Headless smoke test:
+
+```bash
+./.venv/bin/python experiments/social_nav/run_stage2_dynamic.py \
+  --headless --steps 160 --social-method rule
+```
+
+The scripted Stage2 simulator has a fixed timeline of human motion and
+relationship events. Human positions are updated every simulation step and fed
+to MPPI as local hard constraints. Relationship changes trigger a social-field
+update and A* replan from the robot's current pose. With `--social-method llm`,
+the social update runs asynchronously, so the robot keeps following the
+previous A* route until the API result is applied. If the API call fails, the
+shared rule-based costmap fallback is used.
+
+The older manual pygame simulator is still available with:
+
+```bash
+./.venv/bin/python experiments/social_nav/run_stage2_dynamic.py --interactive
+```
 
 ## Shared Cost Modules
 

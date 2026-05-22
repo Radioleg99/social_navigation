@@ -56,8 +56,11 @@ ACTIVITIES = {
     "talking": ["SPEAK", "OBSERVE"],
     "sitting": ["SITTING"],
     "walking": ["WALKING"],
+    "watching": ["OBSERVE"],
+    "arguing": ["SPEAK", "GESTURE"],
+    "sleeping": ["SLEEPING"],
 }
-STATE_ORDER = ["idle", "talking", "sitting", "walking"]
+STATE_ORDER = ["idle", "talking", "sitting", "walking", "watching", "arguing", "sleeping"]
 
 
 def _parse_xy(s: str) -> tuple[float, float]:
@@ -681,6 +684,53 @@ class Human:
 
 
 @dataclass
+class ScriptedHumanKeyframe:
+    t: float
+    pos: tuple[float, float]
+    yaw_deg: float | None = None
+    state: str | None = None
+
+
+@dataclass
+class ScriptedRelationEvent:
+    t: float
+    a: int
+    b: int
+    action: str
+
+
+@dataclass
+class ScriptedHumanTrack:
+    keyframes: list[ScriptedHumanKeyframe]
+
+    def sample(self, t: float) -> Human:
+        kfs = sorted(self.keyframes, key=lambda k: k.t)
+        if t <= kfs[0].t:
+            k = kfs[0]
+            return Human(pos=np.array(k.pos, dtype=np.float32), yaw_deg=k.yaw_deg or 0.0, state=k.state or "idle")
+        if t >= kfs[-1].t:
+            k = kfs[-1]
+            return Human(pos=np.array(k.pos, dtype=np.float32), yaw_deg=k.yaw_deg or 0.0, state=k.state or "idle")
+        for i in range(len(kfs) - 1):
+            k0, k1 = kfs[i], kfs[i + 1]
+            if k0.t <= t <= k1.t:
+                alpha = (t - k0.t) / max(k1.t - k0.t, 1e-6)
+                p0 = np.array(k0.pos, dtype=np.float32)
+                p1 = np.array(k1.pos, dtype=np.float32)
+                pos = p0 + alpha * (p1 - p0)
+                vel = p1 - p0
+                if k1.yaw_deg is not None:
+                    yaw = float(k1.yaw_deg)
+                elif np.linalg.norm(vel) > 0.05:
+                    yaw = math.degrees(math.atan2(float(vel[1]), float(vel[0])))
+                else:
+                    yaw = float(k0.yaw_deg or 0.0)
+                return Human(pos=pos.astype(np.float32), yaw_deg=yaw, state=k1.state or k0.state or "idle")
+        k = kfs[-1]
+        return Human(pos=np.array(k.pos, dtype=np.float32), yaw_deg=k.yaw_deg or 0.0, state=k.state or "idle")
+
+
+@dataclass
 class PlaygroundConfig:
     map_source: str
     background: str
@@ -706,6 +756,13 @@ class PlaygroundConfig:
     astar_smoothing: str
     astar_shortcut_social_threshold: float
     isolate_scene_component: bool
+    stage2_scripted: bool
+    stage2_scenario: str
+    stage2_social_async: bool
+    stage2_dt: float
+    stage2_mppi_horizon: int
+    stage2_replan_interval: float
+    stage2_costmap_interval: float
     width: int
     height: int
 
@@ -781,6 +838,16 @@ class Stage1Playground:
     TOOLBAR_H = 42
     PANEL_W = 280
     HUMAN_R_PX = 8
+    STAGE2_WAYPOINT_RADIUS_M = 0.45
+    STAGE2_GOAL_RADIUS_M = 0.38
+    STAGE2_SLOW_RADIUS_M = 0.90
+    STAGE2_SCENARIOS = (
+        "conversation_crossing",
+        "argument_block",
+        "tv_watchers",
+        "sleeper_and_walker",
+        "queue_split",
+    )
 
     def __init__(self, cfg: PlaygroundConfig) -> None:
         self.cfg = cfg
@@ -860,6 +927,30 @@ class Stage1Playground:
         self._component_labels, self._num_components = label_components(self.grid_free)
         self._scene_component_id: int | None = None
 
+        # Stage2 scripted dynamic playback state. This intentionally lives in
+        # the playground so Stage2 uses the same map, social field, and A* view.
+        self.stage2_enabled = bool(cfg.stage2_scripted)
+        self.stage2_running = False
+        self.stage2_t = 0.0
+        self.stage2_acc = 0.0
+        self.stage2_tracks: list[ScriptedHumanTrack] = []
+        self.stage2_rel_events: list[ScriptedRelationEvent] = []
+        self.stage2_rel_key: tuple[tuple[int, int], ...] = tuple()
+        self.stage2_robot_pos = self.start_xy.copy()
+        self.stage2_robot_yaw = math.radians(float(cfg.start_pose[2]))
+        self.stage2_robot_traj: list[np.ndarray] = [self.stage2_robot_pos.copy()]
+        self.stage2_wp_idx = 0
+        self.stage2_scenario_idx = self._stage2_scenario_index(cfg.stage2_scenario)
+        self.stage2_reset_start_xy = self.start_xy.copy()
+        self.stage2_last_replan_t = 0.0
+        self.stage2_last_costmap_t = -1e9
+        self.stage2_ctrl = None
+        self.stage2_social_worker: threading.Thread | None = None
+        self.stage2_pending_social: tuple[object, str] | None = None
+        self.stage2_social_lock = threading.Lock()
+        self.stage2_requests = 0
+        self.stage2_updates = 0
+
         # Performance caches / throttling. Public interface is unchanged.
         self._base_map_cache_key: tuple[int, int, int] | None = None
         self._base_map_cache_surface: pygame.Surface | None = None
@@ -882,7 +973,11 @@ class Stage1Playground:
         self._scene_component_id = self._choose_scene_component()
 
         pygame.init()
-        pygame.display.set_caption("Stage1 Social Navigation Playground")
+        pygame.display.set_caption(
+            "Stage2 Scripted Social Navigation Playground"
+            if self.stage2_enabled
+            else "Stage1 Social Navigation Playground"
+        )
         self.screen = pygame.display.set_mode((cfg.width, cfg.height), pygame.RESIZABLE)
         try:
             pygame.scrap.init()
@@ -909,6 +1004,8 @@ class Stage1Playground:
             "Stage1 playground ready. F1=log, F2=Layer1 prompt, F3=Layer2 prompt, "
             "F4=console, Tab=edit prompt, Cmd/Ctrl+C=copy."
         )
+        if self.stage2_enabled:
+            self._stage2_reset_script()
 
     def run(self) -> None:
         running = True
@@ -941,6 +1038,8 @@ class Stage1Playground:
                     self._on_mouse_wheel(event)
 
             self._poll_llm_result()
+            self._stage2_poll_social_result()
+            self._stage2_advance()
             if self.dirty:
                 self._recompute()
             self._draw()
@@ -997,17 +1096,30 @@ class Stage1Playground:
         elif key in (pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_d):
             self.tool = "delete"
         elif key == pygame.K_SPACE:
-            self._cycle_cost_view()
+            if self.stage2_enabled:
+                self.stage2_running = not self.stage2_running
+                self._log(f"stage2 {'running' if self.stage2_running else 'paused'}")
+            else:
+                self._cycle_cost_view()
         elif key == pygame.K_LEFTBRACKET:
             self.cfg.astar_human_block_radius = max(0.0, self.cfg.astar_human_block_radius - 0.05)
+            if self.stage2_enabled:
+                self.stage2_ctrl = None
             self._mark_scene_changed(invalidate_llm=False)
             self._log(f"human hard-block radius -> {self.cfg.astar_human_block_radius:.2f}m")
         elif key == pygame.K_RIGHTBRACKET:
             self.cfg.astar_human_block_radius = min(2.0, self.cfg.astar_human_block_radius + 0.05)
+            if self.stage2_enabled:
+                self.stage2_ctrl = None
             self._mark_scene_changed(invalidate_llm=False)
             self._log(f"human hard-block radius -> {self.cfg.astar_human_block_radius:.2f}m")
         elif key == pygame.K_r:
-            self.dirty = True
+            if self.stage2_enabled:
+                self._stage2_reset_script()
+            else:
+                self.dirty = True
+        elif key == pygame.K_n and self.stage2_enabled:
+            self._stage2_next_scenario()
         elif key == pygame.K_c:
             self._cycle_selected_state()
         elif key == pygame.K_e:
@@ -1018,6 +1130,8 @@ class Stage1Playground:
             self._nav_mask_cache_key = None
             self._cost_overlay_cache_key = None
             self._log(f"background: {'RGB' if self.show_rgb else 'occupancy only'}")
+        elif key == pygame.K_v:
+            self._cycle_cost_view()
         return True
 
     def _on_prompt_edit_key(self, event) -> bool:
@@ -1259,6 +1373,580 @@ class Stage1Playground:
             self.llm_dirty = True
         self.dirty = True
 
+    # ── Stage2 scripted dynamic mode ────────────────────────────────────────
+    def _stage2_scenario_index(self, name: str) -> int:
+        if name in self.STAGE2_SCENARIOS:
+            return self.STAGE2_SCENARIOS.index(name)
+        return 0
+
+    def _stage2_scenario_name(self) -> str:
+        return self.STAGE2_SCENARIOS[self.stage2_scenario_idx % len(self.STAGE2_SCENARIOS)]
+
+    def _stage2_next_scenario(self) -> None:
+        self.stage2_scenario_idx = (self.stage2_scenario_idx + 1) % len(self.STAGE2_SCENARIOS)
+        self._stage2_reset_script()
+
+    def _stage2_reset_script(self) -> None:
+        self.stage2_running = False
+        self.stage2_t = 0.0
+        self.stage2_acc = 0.0
+        self.stage2_robot_pos = self.stage2_reset_start_xy.copy()
+        self.stage2_robot_yaw = math.radians(float(self.cfg.start_pose[2]))
+        self.stage2_robot_traj = [self.stage2_robot_pos.copy()]
+        self.stage2_wp_idx = 0
+        self.start_xy = self.stage2_robot_pos.copy()
+        self.stage2_requests = 0
+        self.stage2_updates = 0
+        self.stage2_pending_social = None
+        self.stage2_rel_key = tuple()
+        self.stage2_last_replan_t = 0.0
+        self.stage2_last_costmap_t = -1e9
+
+        start = self.stage2_reset_start_xy.astype(np.float32)
+        goal = self.goal_xy.astype(np.float32)
+        self.stage2_tracks, self.stage2_rel_events = self._stage2_make_scenario(start, goal)
+        self.stage2_rel_events = sorted(self.stage2_rel_events, key=lambda ev: ev.t)
+        self._stage2_sample_script()
+        self._stage2_build_controller()
+        self.stage2_rel_key = tuple(self.groups)
+        self._mark_scene_changed(invalidate_llm=True)
+        self._log(
+            f"Stage2 script reset: {self._stage2_scenario_name()}. "
+            "Space=start/pause, N=scenario, R=reset, V=cost view."
+        )
+
+    def _stage2_make_scenario(
+        self,
+        start: np.ndarray,
+        goal: np.ndarray,
+    ) -> tuple[list[ScriptedHumanTrack], list[ScriptedRelationEvent]]:
+        axis = goal - start
+        n = float(np.linalg.norm(axis))
+        if n < 1e-4:
+            axis = np.array([1.0, 0.0], dtype=np.float32)
+            n = 1.0
+        axis = axis / n
+        perp = np.array([-axis[1], axis[0]], dtype=np.float32)
+        mid = start + 0.50 * (goal - start)
+        left = start + 0.30 * (goal - start)
+        right = start + 0.72 * (goal - start)
+        far = start + 0.88 * (goal - start)
+        axis_yaw = math.degrees(math.atan2(float(axis[1]), float(axis[0])))
+        back_yaw = math.degrees(math.atan2(float(-axis[1]), float(-axis[0])))
+
+        def snap(xy: np.ndarray) -> tuple[float, float]:
+            snapped = _nearest_free_xy(self.scene_map, self.grid_free_astar, xy, self.downscale)
+            if snapped is None:
+                snapped = xy
+            return float(snapped[0]), float(snapped[1])
+
+        def p(frac: float, offset: float) -> tuple[float, float]:
+            return snap(start + frac * (goal - start) + perp * offset)
+
+        def yaw(a: tuple[float, float], b: tuple[float, float]) -> float:
+            return math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+
+        def shifted(base: tuple[float, float], forward: float = 0.0, lateral: float = 0.0) -> tuple[float, float]:
+            b = np.array(base, dtype=np.float32)
+            return snap(b + axis * forward + perp * lateral)
+
+        def kf(
+            t: float,
+            base: tuple[float, float],
+            yaw_deg: float,
+            state: str,
+            forward: float = 0.0,
+            lateral: float = 0.0,
+            yaw_delta: float = 0.0,
+        ) -> ScriptedHumanKeyframe:
+            return ScriptedHumanKeyframe(
+                t,
+                shifted(base, forward=forward, lateral=lateral),
+                yaw_deg=yaw_deg + yaw_delta,
+                state=state,
+            )
+
+        scenario = self._stage2_scenario_name()
+        if scenario == "argument_block":
+            a0_far = p(0.42, 1.20)
+            a0_mid = p(0.49, 0.22)
+            a1_far = p(0.58, -1.15)
+            a1_mid = p(0.55, -0.18)
+            bystander0 = p(0.72, 1.25)
+            bystander1 = p(0.72, 0.60)
+            y01 = yaw(a0_mid, a1_mid)
+            y10 = yaw(a1_mid, a0_mid)
+            tracks = [
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, a0_far, yaw_deg=y01, state="walking"),
+                    ScriptedHumanKeyframe(7.0, a0_mid, yaw_deg=y01, state="talking"),
+                    kf(13.0, a0_mid, y01, "arguing", forward=0.00, lateral=0.00, yaw_delta=0.0),
+                    kf(16.0, a0_mid, y01, "arguing", forward=0.10, lateral=0.05, yaw_delta=9.0),
+                    kf(19.5, a0_mid, y01, "arguing", forward=-0.05, lateral=-0.06, yaw_delta=-7.0),
+                    kf(23.0, a0_mid, y01, "arguing", forward=0.08, lateral=-0.03, yaw_delta=6.0),
+                    kf(26.0, a0_mid, y01, "arguing", forward=0.00, lateral=0.02, yaw_delta=-4.0),
+                    ScriptedHumanKeyframe(36.0, p(0.34, 1.10), yaw_deg=back_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, a1_far, yaw_deg=y10, state="walking"),
+                    ScriptedHumanKeyframe(8.0, a1_mid, yaw_deg=y10, state="talking"),
+                    kf(13.0, a1_mid, y10, "arguing", forward=0.00, lateral=0.00, yaw_delta=0.0),
+                    kf(16.0, a1_mid, y10, "arguing", forward=-0.08, lateral=-0.04, yaw_delta=-8.0),
+                    kf(19.5, a1_mid, y10, "arguing", forward=0.06, lateral=0.05, yaw_delta=7.0),
+                    kf(23.0, a1_mid, y10, "arguing", forward=-0.10, lateral=0.02, yaw_delta=-6.0),
+                    kf(26.0, a1_mid, y10, "arguing", forward=0.00, lateral=-0.02, yaw_delta=4.0),
+                    ScriptedHumanKeyframe(36.0, p(0.70, -1.05), yaw_deg=axis_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, bystander0, yaw_deg=back_yaw, state="idle"),
+                    ScriptedHumanKeyframe(16.0, bystander0, yaw_deg=back_yaw, state="idle"),
+                    ScriptedHumanKeyframe(22.0, bystander1, yaw_deg=yaw(bystander1, a0_mid), state="watching"),
+                    ScriptedHumanKeyframe(32.0, bystander1, yaw_deg=yaw(bystander1, a0_mid), state="watching"),
+                    ScriptedHumanKeyframe(40.0, p(0.90, 1.20), yaw_deg=axis_yaw, state="walking"),
+                ]),
+            ]
+            events = [
+                ScriptedRelationEvent(7.0, 0, 1, "add"),
+                ScriptedRelationEvent(13.0, 0, 1, "remove"),
+                ScriptedRelationEvent(13.1, 0, 1, "add"),
+                ScriptedRelationEvent(22.0, 1, 2, "add"),
+                ScriptedRelationEvent(28.0, 1, 2, "remove"),
+                ScriptedRelationEvent(30.0, 0, 1, "remove"),
+            ]
+            return tracks, events
+
+        if scenario == "tv_watchers":
+            sofa0 = p(0.48, 0.75)
+            sofa1 = p(0.58, 0.78)
+            tv = p(0.53, -0.85)
+            walker0 = p(0.22, -1.20)
+            walker1 = p(0.84, -1.15)
+            y_tv0 = yaw(sofa0, tv)
+            y_tv1 = yaw(sofa1, tv)
+            tracks = [
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, sofa0, yaw_deg=y_tv0, state="sitting"),
+                    ScriptedHumanKeyframe(6.0, sofa0, yaw_deg=y_tv0, state="watching"),
+                    ScriptedHumanKeyframe(28.0, sofa0, yaw_deg=y_tv0, state="watching"),
+                    ScriptedHumanKeyframe(38.0, p(0.38, 1.10), yaw_deg=back_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, sofa1, yaw_deg=y_tv1, state="sitting"),
+                    ScriptedHumanKeyframe(6.0, sofa1, yaw_deg=y_tv1, state="watching"),
+                    ScriptedHumanKeyframe(28.0, sofa1, yaw_deg=y_tv1, state="watching"),
+                    ScriptedHumanKeyframe(38.0, p(0.68, 1.10), yaw_deg=axis_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, walker0, yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(18.0, walker1, yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(30.0, walker1, yaw_deg=axis_yaw, state="idle"),
+                ]),
+            ]
+            events = [
+                ScriptedRelationEvent(6.0, 0, 1, "add"),
+                ScriptedRelationEvent(30.0, 0, 1, "remove"),
+            ]
+            return tracks, events
+
+        if scenario == "sleeper_and_walker":
+            sleeper = p(0.54, 0.42)
+            helper0 = p(0.28, -1.20)
+            helper1 = p(0.50, -0.45)
+            passer0 = p(0.12, 1.10)
+            passer1 = p(0.82, 1.10)
+            tracks = [
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, sleeper, yaw_deg=back_yaw, state="sleeping"),
+                    ScriptedHumanKeyframe(20.0, sleeper, yaw_deg=back_yaw, state="sleeping"),
+                    ScriptedHumanKeyframe(32.0, sleeper, yaw_deg=back_yaw, state="sitting"),
+                    ScriptedHumanKeyframe(44.0, sleeper, yaw_deg=back_yaw, state="idle"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, helper0, yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(12.0, helper1, yaw_deg=yaw(helper1, sleeper), state="walking"),
+                    kf(18.0, helper1, yaw(helper1, sleeper), "talking", forward=0.00, lateral=0.00, yaw_delta=0.0),
+                    kf(22.0, helper1, yaw(helper1, sleeper), "talking", forward=0.04, lateral=0.03, yaw_delta=5.0),
+                    kf(26.0, helper1, yaw(helper1, sleeper), "talking", forward=-0.03, lateral=-0.02, yaw_delta=-4.0),
+                    ScriptedHumanKeyframe(32.0, p(0.72, -0.90), yaw_deg=axis_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, passer0, yaw_deg=axis_yaw, state="idle"),
+                    ScriptedHumanKeyframe(18.0, passer0, yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(34.0, passer1, yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(44.0, passer1, yaw_deg=axis_yaw, state="idle"),
+                ]),
+            ]
+            events = [
+                ScriptedRelationEvent(18.0, 0, 1, "add"),
+                ScriptedRelationEvent(29.0, 0, 1, "remove"),
+            ]
+            return tracks, events
+
+        if scenario == "queue_split":
+            q0 = p(0.44, 0.55)
+            q1 = p(0.52, 0.55)
+            q2 = p(0.60, 0.55)
+            tracks = [
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, p(0.34, 1.10), yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(8.0, q0, yaw_deg=axis_yaw, state="idle"),
+                    ScriptedHumanKeyframe(22.0, q0, yaw_deg=axis_yaw, state="idle"),
+                    ScriptedHumanKeyframe(34.0, p(0.70, 1.15), yaw_deg=axis_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, p(0.48, 1.15), yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(10.0, q1, yaw_deg=axis_yaw, state="idle"),
+                    kf(22.0, q1, axis_yaw, "talking", forward=0.00, lateral=0.00, yaw_delta=0.0),
+                    kf(25.0, q1, axis_yaw, "talking", forward=0.03, lateral=-0.04, yaw_delta=-12.0),
+                    kf(28.0, q1, axis_yaw, "talking", forward=-0.02, lateral=0.02, yaw_delta=8.0),
+                    ScriptedHumanKeyframe(34.0, p(0.78, 0.95), yaw_deg=axis_yaw, state="walking"),
+                ]),
+                ScriptedHumanTrack([
+                    ScriptedHumanKeyframe(0.0, p(0.62, 1.20), yaw_deg=axis_yaw, state="walking"),
+                    ScriptedHumanKeyframe(12.0, q2, yaw_deg=axis_yaw, state="idle"),
+                    kf(22.0, q2, axis_yaw, "talking", forward=0.00, lateral=0.00, yaw_delta=0.0),
+                    kf(25.0, q2, axis_yaw, "talking", forward=-0.04, lateral=0.03, yaw_delta=11.0),
+                    kf(28.0, q2, axis_yaw, "talking", forward=0.02, lateral=-0.02, yaw_delta=-7.0),
+                    ScriptedHumanKeyframe(34.0, p(0.86, 0.75), yaw_deg=axis_yaw, state="walking"),
+                ]),
+            ]
+            events = [
+                ScriptedRelationEvent(16.0, 1, 2, "add"),
+                ScriptedRelationEvent(28.0, 1, 2, "remove"),
+            ]
+            return tracks, events
+
+        a0_0 = snap(mid + perp * 0.95)
+        a0_1 = snap(mid + perp * 0.25)
+        a1_0 = snap(mid - perp * 0.95)
+        a1_1 = snap(mid - perp * 0.25)
+        a2_0 = snap(left + perp * 1.30)
+        a2_1 = snap(right + perp * 1.30)
+        yaw_to_1 = math.degrees(math.atan2(a1_1[1] - a0_1[1], a1_1[0] - a0_1[0]))
+        yaw_to_0 = math.degrees(math.atan2(a0_1[1] - a1_1[1], a0_1[0] - a1_1[0]))
+
+        tracks = [
+            ScriptedHumanTrack([
+                ScriptedHumanKeyframe(0.0, a0_0, yaw_deg=yaw_to_1, state="idle"),
+                ScriptedHumanKeyframe(6.0, a0_0, yaw_deg=yaw_to_1, state="walking"),
+                ScriptedHumanKeyframe(12.0, a0_1, yaw_deg=yaw_to_1, state="talking"),
+                kf(16.0, a0_1, yaw_to_1, "talking", forward=0.03, lateral=0.03, yaw_delta=4.0),
+                kf(20.0, a0_1, yaw_to_1, "talking", forward=-0.02, lateral=-0.02, yaw_delta=-3.0),
+                kf(24.0, a0_1, yaw_to_1, "talking", forward=0.02, lateral=0.00, yaw_delta=2.0),
+                ScriptedHumanKeyframe(32.0, a0_0, yaw_deg=yaw_to_1, state="idle"),
+            ]),
+            ScriptedHumanTrack([
+                ScriptedHumanKeyframe(0.0, a1_0, yaw_deg=yaw_to_0, state="idle"),
+                ScriptedHumanKeyframe(12.0, a1_1, yaw_deg=yaw_to_0, state="talking"),
+                kf(16.0, a1_1, yaw_to_0, "talking", forward=-0.03, lateral=-0.03, yaw_delta=-4.0),
+                kf(20.0, a1_1, yaw_to_0, "talking", forward=0.02, lateral=0.02, yaw_delta=3.0),
+                kf(24.0, a1_1, yaw_to_0, "talking", forward=-0.02, lateral=0.00, yaw_delta=-2.0),
+                ScriptedHumanKeyframe(32.0, a1_0, yaw_deg=yaw_to_0, state="idle"),
+            ]),
+            ScriptedHumanTrack([
+                ScriptedHumanKeyframe(0.0, a2_0, yaw_deg=math.degrees(math.atan2(axis[1], axis[0])), state="idle"),
+                ScriptedHumanKeyframe(18.0, a2_0, yaw_deg=math.degrees(math.atan2(axis[1], axis[0])), state="walking"),
+                ScriptedHumanKeyframe(30.0, a2_1, yaw_deg=math.degrees(math.atan2(axis[1], axis[0])), state="walking"),
+                ScriptedHumanKeyframe(40.0, a2_1, yaw_deg=math.degrees(math.atan2(axis[1], axis[0])), state="idle"),
+            ]),
+        ]
+        events = [
+            ScriptedRelationEvent(12.0, 0, 1, "add"),
+            ScriptedRelationEvent(24.0, 0, 1, "remove"),
+        ]
+        return tracks, events
+
+    def _stage2_active_groups(self) -> list[tuple[int, int]]:
+        active: set[tuple[int, int]] = set()
+        for ev in self.stage2_rel_events:
+            if ev.t > self.stage2_t:
+                break
+            pair = tuple(sorted((ev.a, ev.b)))
+            if ev.action == "add":
+                active.add(pair)
+            elif ev.action == "remove":
+                active.discard(pair)
+        return sorted(active)
+
+    def _stage2_sample_script(self) -> None:
+        self.humans = [track.sample(self.stage2_t) for track in self.stage2_tracks]
+        self.groups = self._stage2_active_groups()
+
+    def _stage2_build_controller(self) -> None:
+        try:
+            from experiments.social_nav.mppi_nav import MPPINav
+
+            self.stage2_ctrl = MPPINav(
+                scene_map=self.scene_map,
+                grid_free=self.grid_free_astar,
+                distance_transform=self.dist_transform,
+                grid_spacing=self.grid_spacing,
+                downscale=self.downscale,
+                horizon=max(8, int(self.cfg.stage2_mppi_horizon)),
+                num_samples=384,
+                num_iters=2,
+                dt=self.cfg.stage2_dt,
+                temperature=1.0,
+                noise_alpha=0.8,
+                noise_v=0.12,
+                noise_w_deg=35,
+                v_min=-0.05,
+                v_max=0.40,
+                w_max_deg=120,
+                cruise_speed=0.20,
+                goal_stage_weight=4.0,
+                goal_terminal_weight=20.0,
+                heading_terminal_weight=0.5,
+                clearance_threshold=0.25,
+                clearance_weight=20.0,
+                control_weight=0.1,
+                smoothness_weight=1.0,
+                social_params=self.social_params or [],
+                social_weight=max(12.0, self.cfg.astar_social_weight * 0.60),
+                human_positions=[tuple(h.pos) for h in self.humans],
+                human_radius=max(0.30, float(self.cfg.astar_human_block_radius)),
+                seed=42,
+            )
+        except Exception as exc:
+            self.stage2_ctrl = None
+            self._log(f"Stage2 MPPI controller unavailable: {exc}")
+
+    def _stage2_refresh_param_geometry(self) -> None:
+        if not self.social_params:
+            return
+        for i, h in enumerate(self.humans):
+            entity_id = f"person_{i}"
+            for p in self.social_params:
+                if getattr(p, "entity_id", "") == entity_id:
+                    p.pos = (float(h.pos[0]), float(h.pos[1]))
+                    p.yaw_deg = float(h.yaw_deg)
+        for p in self.social_params:
+            eid = str(getattr(p, "entity_id", ""))
+            if not eid.startswith("group_"):
+                continue
+            parts = [int(x) for x in eid.split("_")[1:] if x.isdigit()]
+            if len(parts) < 2 or any(i >= len(self.humans) for i in parts[:2]):
+                continue
+            pts = np.array([self.humans[i].pos for i in parts[:2]], dtype=np.float32)
+            p.pos = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+            d = self.humans[parts[1]].pos - self.humans[parts[0]].pos
+            p.yaw_deg = math.degrees(math.atan2(float(d[1]), float(d[0])))
+
+    def _stage2_request_social_update(self, reason: str) -> None:
+        self.stage2_requests += 1
+        if self.cfg.social_method != "llm":
+            self.social_params = None
+            self.dirty = True
+            self.stage2_updates += 1
+            self._log(f"Stage2 rule social update: {reason}")
+            return
+        if not self.cfg.stage2_social_async:
+            try:
+                params, log = build_entity_params(
+                    self._scene_description(),
+                    method="llm",
+                    llm_model=self.cfg.llm_model,
+                    verbose=True,
+                    robot_pos=tuple(float(x) for x in self.stage2_robot_pos),
+                    robot_goal=tuple(float(x) for x in self.goal_xy),
+                    prompt_templates=self._prompt_templates(),
+                )
+                self.social_params = params
+                self.llm_log = log
+                self.llm_dirty = False
+                self._stage2_refresh_param_geometry()
+                self.stage2_updates += 1
+                self.dirty = True
+                self._log(f"Stage2 sync LLM social update applied: {len(params)} params")
+                self._log(log)
+            except Exception as exc:
+                self._log(f"Stage2 sync LLM update failed: {exc}")
+                self._log(traceback.format_exc())
+            return
+        if self.stage2_social_worker is not None and self.stage2_social_worker.is_alive():
+            self._log(f"Stage2 LLM update already running; skipped {reason}")
+            return
+
+        scene = self._scene_description()
+        robot_pos = tuple(float(x) for x in self.stage2_robot_pos)
+        robot_goal = tuple(float(x) for x in self.goal_xy)
+        llm_model = self.cfg.llm_model
+        templates = self._prompt_templates()
+        t_req = self.stage2_t
+        self.llm_loading = True
+        self.status = f"Stage2 async LLM social update: {reason}"
+        self._log(self.status)
+
+        def worker() -> None:
+            try:
+                params, log = build_entity_params(
+                    scene,
+                    method="llm",
+                    llm_model=llm_model,
+                    verbose=True,
+                    robot_pos=robot_pos,
+                    robot_goal=robot_goal,
+                    prompt_templates=templates,
+                )
+                result = ("ok", params, f"{reason}@{t_req:.1f}s\n{log}")
+            except Exception as exc:
+                result = ("err", exc, traceback.format_exc())
+            with self.stage2_social_lock:
+                self.stage2_pending_social = result
+
+        self.stage2_social_worker = threading.Thread(target=worker, daemon=True)
+        self.stage2_social_worker.start()
+
+    def _stage2_poll_social_result(self) -> None:
+        with self.stage2_social_lock:
+            result = self.stage2_pending_social
+            self.stage2_pending_social = None
+        if result is None:
+            return
+        kind, payload, log = result
+        self.llm_loading = False
+        if kind == "ok":
+            self.social_params = payload
+            self.llm_log = log
+            self.llm_dirty = False
+            self._stage2_refresh_param_geometry()
+            self.stage2_updates += 1
+            self.prev_social_costmap = self.social_costmap.copy() if self.social_costmap is not None else None
+            self.dirty = True
+            self._log(f"Stage2 LLM social update applied: {len(self.social_params)} params")
+            self._log(log)
+        else:
+            self._log(f"Stage2 LLM update failed: {payload}")
+            self._log(log)
+
+    def _stage2_refresh_dynamic_social_field(self, force: bool = False) -> None:
+        if not self.stage2_enabled:
+            return
+        if (
+            not force
+            and self.cfg.stage2_costmap_interval > 0.0
+            and self.stage2_t - self.stage2_last_costmap_t < self.cfg.stage2_costmap_interval
+        ):
+            return
+        if not self.humans:
+            self.social_costmap = None
+            self.stage2_last_costmap_t = self.stage2_t
+            self._costmap_version += 1
+            self._cost_overlay_cache_key = None
+            self._cost_overlay_cache_surface = None
+            return
+
+        params = self.social_params
+        if self.cfg.social_method == "rule" or params is None:
+            params, _ = build_entity_params(
+                self._scene_description(),
+                method="rule",
+                llm_model="rule",
+                verbose=False,
+                robot_pos=tuple(float(x) for x in self.stage2_robot_pos),
+                robot_goal=tuple(float(x) for x in self.goal_xy),
+            )
+            if self.cfg.social_method == "rule":
+                self.social_params = params
+        else:
+            self._stage2_refresh_param_geometry()
+            params = self.social_params
+
+        self.social_costmap = _synthesize_costmap_on_scene_grid(
+            params,
+            self.scene_map,
+            self.grid_free_astar.shape,
+            self.downscale,
+            distance_transform=self.dist_transform,
+            clearance_cap=0.5,
+            clearance_weight=0.3,
+        )
+        if self.stage2_ctrl is not None:
+            self.stage2_ctrl.update_social_params(params or [])
+        self.stage2_last_costmap_t = self.stage2_t
+        self._costmap_version += 1
+        self._cost_overlay_cache_key = None
+        self._cost_overlay_cache_surface = None
+
+    def _stage2_advance(self) -> None:
+        if not self.stage2_enabled or not self.stage2_running:
+            return
+        dt_real = self.clock.get_time() / 1000.0
+        self.stage2_acc += min(dt_real, 0.1)
+        while self.stage2_acc >= self.cfg.stage2_dt:
+            self._stage2_step(self.cfg.stage2_dt)
+            self.stage2_acc -= self.cfg.stage2_dt
+
+    def _stage2_step(self, dt: float) -> None:
+        old_key = self.stage2_rel_key
+        self.stage2_t += dt
+        self._stage2_sample_script()
+        new_key = tuple(self.groups)
+        relation_changed = new_key != old_key
+        if relation_changed:
+            self.stage2_rel_key = new_key
+            self._stage2_request_social_update("relationship_changed")
+
+        self._stage2_refresh_param_geometry()
+        if self.stage2_ctrl is None:
+            self._stage2_build_controller()
+        if self.stage2_ctrl is not None:
+            self.stage2_ctrl.update_humans([tuple(h.pos) for h in self.humans])
+            self.stage2_ctrl.update_social_params(self.social_params or [])
+        self._stage2_refresh_dynamic_social_field(force=relation_changed or self.social_costmap is None)
+
+        if (
+            not self.dirty
+            and self.cfg.stage2_replan_interval > 0.0
+            and self.stage2_t - self.stage2_last_replan_t >= self.cfg.stage2_replan_interval
+        ):
+            self.dirty = True
+
+        if self.path is None or len(self.path) == 0:
+            self.dirty = True
+            return
+        if self.dirty:
+            self.status = "replan pending; tracking previous A* path"
+        goal_xy = self.planned_goal_xy.astype(np.float32)
+        goal_dist = float(np.linalg.norm(self.stage2_robot_pos - goal_xy))
+        if goal_dist < self.STAGE2_GOAL_RADIUS_M:
+            self.stage2_running = False
+            if self.stage2_ctrl is not None:
+                self.stage2_ctrl.reset()
+            self.status = "Stage2 arrived"
+            return
+
+        while self.stage2_wp_idx < len(self.path) - 1:
+            if float(np.linalg.norm(self.stage2_robot_pos - self.path[self.stage2_wp_idx])) < self.STAGE2_WAYPOINT_RADIUS_M:
+                self.stage2_wp_idx += 1
+            else:
+                break
+
+        # A* may snap the user's requested goal to a nearby free cell. The local
+        # controller must finish at that planned goal, then brake explicitly;
+        # MPPI's cost has no zero-velocity terminal constraint.
+        near_final_leg = self.stage2_wp_idx >= len(self.path) - 2 or goal_dist < self.STAGE2_SLOW_RADIUS_M
+        target = goal_xy if near_final_leg else self.path[min(self.stage2_wp_idx, len(self.path) - 1)]
+        if self.stage2_ctrl is not None:
+            state = np.array([self.stage2_robot_pos[0], self.stage2_robot_pos[1], self.stage2_robot_yaw], dtype=np.float32)
+            v, w, _ = self.stage2_ctrl.step(state, target)
+            if goal_dist < self.STAGE2_SLOW_RADIUS_M:
+                v = float(np.clip(v, -0.02, max(0.05, 0.45 * goal_dist)))
+        else:
+            d = target - self.stage2_robot_pos
+            heading = math.atan2(float(d[1]), float(d[0]))
+            err = math.atan2(math.sin(heading - self.stage2_robot_yaw), math.cos(heading - self.stage2_robot_yaw))
+            v = min(0.15, max(0.04, 0.45 * goal_dist))
+            w = float(np.clip(err * 2.0, -1.0, 1.0))
+        self.stage2_robot_pos[0] += dt * v * math.cos(self.stage2_robot_yaw)
+        self.stage2_robot_pos[1] += dt * v * math.sin(self.stage2_robot_yaw)
+        self.stage2_robot_yaw = math.atan2(
+            math.sin(self.stage2_robot_yaw + dt * w),
+            math.cos(self.stage2_robot_yaw + dt * w),
+        )
+        self.start_xy = self.stage2_robot_pos.copy()
+        self.stage2_robot_traj.append(self.stage2_robot_pos.copy())
+
     def _cycle_cost_view(self) -> None:
         order = ["current", "delta", "off"]
         idx = order.index(self.cost_view) if self.cost_view in order else 0
@@ -1297,6 +1985,7 @@ class Stage1Playground:
         if self.cfg.isolate_scene_component:
             self._scene_component_id = self._choose_scene_component()
         scene = self._scene_description()
+        plan_start_xy = self.stage2_robot_pos if self.stage2_enabled else self.start_xy
         self.social_costmap = None
         if self.humans:
             params = self.social_params
@@ -1306,9 +1995,11 @@ class Stage1Playground:
                     method="rule",
                     llm_model="rule",
                     verbose=False,
-                    robot_pos=tuple(self.start_xy),
+                    robot_pos=tuple(plan_start_xy),
                     robot_goal=tuple(self.goal_xy),
                 )
+                if self.cfg.social_method == "rule":
+                    self.social_params = params
             self.social_costmap = _synthesize_costmap_on_scene_grid(
                 params,
                 self.scene_map,
@@ -1318,10 +2009,13 @@ class Stage1Playground:
                 clearance_cap=0.5,
                 clearance_weight=0.3,
             )
+            if self.stage2_enabled and self.stage2_ctrl is not None:
+                self.stage2_ctrl.update_social_params(params)
+                self.stage2_ctrl.update_humans([tuple(h.pos) for h in self.humans])
 
         try:
             grid = self._blocked_grid()
-            start_xy = _nearest_free_xy(self.scene_map, grid, self.start_xy, self.downscale)
+            start_xy = _nearest_free_xy(self.scene_map, grid, plan_start_xy, self.downscale)
             goal_xy = _nearest_free_xy(self.scene_map, grid, self.goal_xy, self.downscale)
             if start_xy is None or goal_xy is None:
                 raise RuntimeError("start/goal cannot be snapped to free space")
@@ -1347,6 +2041,9 @@ class Stage1Playground:
                 )
             else:
                 self.path = raw
+            if self.stage2_enabled:
+                self.stage2_wp_idx = 0
+                self.stage2_last_replan_t = self.stage2_t
             self.status = f"path={len(self.path) if self.path is not None else 0} humans={len(self.humans)} groups={len(self.groups)}"
         except Exception as exc:
             self.path = None
@@ -1378,7 +2075,7 @@ class Stage1Playground:
         self._log(self.status)
 
         scene = self._scene_description()
-        robot_pos = tuple(self.start_xy)
+        robot_pos = tuple(self.stage2_robot_pos if self.stage2_enabled else self.start_xy)
         robot_goal = tuple(self.goal_xy)
         llm_model = self.cfg.llm_model
         templates = self._prompt_templates()
@@ -1436,7 +2133,7 @@ class Stage1Playground:
                 method="llm",
                 llm_model=self.cfg.llm_model,
                 verbose=True,
-                robot_pos=tuple(self.start_xy),
+                robot_pos=tuple(self.stage2_robot_pos if self.stage2_enabled else self.start_xy),
                 robot_goal=tuple(self.goal_xy),
                 prompt_templates=self._prompt_templates(),
             )
@@ -1653,6 +2350,7 @@ class Stage1Playground:
         rect = self._map_rect()
         self._draw_map(rect)
         self._draw_path()
+        self._draw_stage2_robot()
         self._draw_humans()
         self._draw_start_goal()
         self._draw_toolbar()
@@ -1812,12 +2510,36 @@ class Stage1Playground:
         pygame.draw.lines(self.screen, (35, 110, 210), False, pts, 4)
         pygame.draw.lines(self.screen, (230, 245, 255), False, pts, 1)
 
+    def _draw_stage2_robot(self) -> None:
+        if not self.stage2_enabled:
+            return
+        if len(self.stage2_robot_traj) > 1:
+            pygame.draw.lines(
+                self.screen,
+                (40, 190, 130),
+                False,
+                [self._world_to_screen(p) for p in self.stage2_robot_traj],
+                3,
+            )
+        p = self._world_to_screen(self.stage2_robot_pos)
+        pygame.draw.circle(self.screen, (45, 150, 245), p, 10)
+        pygame.draw.circle(self.screen, (255, 255, 255), p, 10, 2)
+        tip = (
+            int(p[0] + math.cos(self.stage2_robot_yaw) * 24),
+            int(p[1] - math.sin(self.stage2_robot_yaw) * 24),
+        )
+        pygame.draw.line(self.screen, (255, 255, 255), p, tip, 2)
+        self._draw_text("R", (p[0] + 12, p[1] - 10), (255, 255, 255))
+
     def _draw_humans(self) -> None:
         colors = {
             "idle": (255, 160, 70),
             "talking": (230, 110, 220),
             "sitting": (150, 120, 230),
             "walking": (60, 210, 230),
+            "watching": (95, 180, 255),
+            "arguing": (235, 65, 55),
+            "sleeping": (130, 150, 165),
         }
         for a, b in self.groups:
             if a < len(self.humans) and b < len(self.humans):
@@ -1828,7 +2550,8 @@ class Stage1Playground:
             col = colors.get(h.state, (220, 220, 220))
             rect = self._map_rect()
             grid_px = rect.width / max(self.grid_free_astar.shape[1], 1)
-            ps = max(12, int((0.8 / max(self.grid_spacing, 1e-6)) * grid_px))
+            ps_m = max(0.30, float(self.cfg.astar_human_block_radius))
+            ps = max(12, int((ps_m / max(self.grid_spacing, 1e-6)) * grid_px))
             pygame.draw.circle(self.screen, (*col, 35), p, ps, 1)
             pygame.draw.circle(self.screen, col, p, self.HUMAN_R_PX)
             if i == self.selected_human or i == self.pending_relation:
@@ -1860,7 +2583,11 @@ class Stage1Playground:
             self._draw_text(f"{key} {name}", (x + 8, 14), (235, 238, 245))
             x += 104
         self._draw_text(
-            "Space costmap  C state  Wheel yaw  E export  R replan  F4/` console  Cmd/Ctrl+C copy",
+            (
+                "Space run/pause  N scenario  V costmap  C state  R reset script  F4/` console"
+                if self.stage2_enabled
+                else "Space costmap  C state  Wheel yaw  E export  R replan  F4/` console  Cmd/Ctrl+C copy"
+            ),
             (x + 8, 14),
             (210, 215, 225),
         )
@@ -1886,8 +2613,26 @@ class Stage1Playground:
 
     def _panel_status_lines(self) -> list[str]:
         return [
-            "Stage1 Playground",
+            "Stage2 Scripted Playground" if self.stage2_enabled else "Stage1 Playground",
             f"tool: {self.tool}",
+            f"AI: {'ON llm' if self.cfg.social_method == 'llm' else 'OFF rule'}",
+            *(
+                [
+                    f"stage2: {'running' if self.stage2_running else 'paused'} t={self.stage2_t:.1f}s",
+                    f"scenario: {self._stage2_scenario_name()}",
+                    f"mppi horizon: {self.cfg.stage2_mppi_horizon} ({self.cfg.stage2_mppi_horizon * self.cfg.stage2_dt:.1f}s)",
+                    (
+                        f"replan dt: {self.cfg.stage2_replan_interval:.1f}s"
+                        if self.cfg.stage2_replan_interval > 0.0
+                        else "replan: relation only"
+                    ),
+                    f"costmap dt: {self.cfg.stage2_costmap_interval:.1f}s",
+                    f"robot: {self.stage2_robot_pos[0]:.2f}, {self.stage2_robot_pos[1]:.2f}",
+                    f"social req/upd: {self.stage2_requests}/{self.stage2_updates}",
+                ]
+                if self.stage2_enabled
+                else []
+            ),
             f"humans: {len(self.humans)}",
             f"groups: {len(self.groups)}",
             f"component: {self._scene_component_id}",
@@ -1907,9 +2652,12 @@ class Stage1Playground:
         return [
             "1 start  2 goal  3 human",
             "4 relation  D delete",
+            "Space run/pause" if self.stage2_enabled else "Space cost view",
+            "N next scenario" if self.stage2_enabled else "",
+            "R reset script" if self.stage2_enabled else "R replan",
+            "V cost view" if self.stage2_enabled else "",
             "E export",
             "[ ] block radius",
-            "Space cost view",
             "F1 log  F2 L1  F3 L2",
             "F4/` expand console",
             "Cmd/Ctrl+C copy",
@@ -2135,6 +2883,49 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         default=True,
     )
+    p.add_argument(
+        "--stage2-scripted",
+        action="store_true",
+        help="Run scripted dynamic Stage2 inside this playground: humans move, relations change, A* replans, MPPI tracks locally.",
+    )
+    p.add_argument(
+        "--stage2-scenario",
+        choices=list(Stage1Playground.STAGE2_SCENARIOS),
+        default="conversation_crossing",
+        help="Initial scripted Stage2 timeline. Press N in the playground to cycle scenarios.",
+    )
+    p.add_argument(
+        "--stage2-social-async",
+        dest="stage2_social_async",
+        action="store_true",
+        default=True,
+        help="When --social-method llm is used, refresh social params in a background thread.",
+    )
+    p.add_argument(
+        "--no-stage2-social-async",
+        dest="stage2_social_async",
+        action="store_false",
+        help="Block on LLM social refresh in Stage2. Useful only for debugging.",
+    )
+    p.add_argument("--stage2-dt", type=float, default=0.1)
+    p.add_argument(
+        "--stage2-mppi-horizon",
+        type=int,
+        default=32,
+        help="MPPI rollout horizon for Stage2 local control. With dt=0.1, 32 means 3.2s lookahead.",
+    )
+    p.add_argument(
+        "--stage2-replan-interval",
+        type=float,
+        default=0.0,
+        help="Seconds between low-rate A* replans in Stage2 while humans move. Set <=0 to replan only on relationship changes.",
+    )
+    p.add_argument(
+        "--stage2-costmap-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between full-grid social costmap refreshes in Stage2. MPPI human updates still run every tick.",
+    )
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=820)
     return p.parse_args()
@@ -2142,6 +2933,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    argv = set(sys.argv[1:])
+    if (
+        args.stage2_scripted
+        and "--map-source" not in argv
+        and args.map_source == "birdview"
+        and args.layout_json is not None
+        and args.layout_json.is_file()
+    ):
+        args.map_source = "scene-xml"
+        if "--background" not in argv:
+            args.background = "rgb"
+        if args.scene_graph is None:
+            default_sg = Path("outputs/procthor/train_9/scene_graph.json")
+            if default_sg.is_file():
+                args.scene_graph = default_sg
+        print("[stage1-playground] --stage2-scripted defaulting to scene-xml train_9 playground background")
     cfg = PlaygroundConfig(**vars(args))
     Stage1Playground(cfg).run()
 

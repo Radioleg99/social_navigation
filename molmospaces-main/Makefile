@@ -12,6 +12,8 @@ LAYOUT  = assets/layouts/FloorPlan203_object_positions.json
 START   = -1.4,4.6,0
 GOAL    = -0.6,4.6
 SOCIAL  = rule
+LLM_MODEL = moonshot-v1-8k
+STAGE2_SCENARIO = conversation_crossing
 STEPS   = 200
 
 COMMON  = experiments/social_nav/run_pipeline.py \
@@ -61,7 +63,28 @@ playground:
 	    --start-pose 2.0,4.0,0.0 \
 	    --goal-xy 9.0,4.0 \
 	    --birdview-downscale 6 \
+	    --astar-human-block-radius 0.65 \
 	    --social-method $(SOCIAL)
+
+## playground-stage2: 动态 Stage2 scripted playground（SCENARIO=conversation_crossing|argument_block|tv_watchers|sleeper_and_walker|queue_split）
+playground-stage2:
+	mkdir -p outputs
+	$(ENV) $(PYTHON_PLAIN) experiments/social_nav/stage1_playground.py \
+	    --stage2-scripted \
+	    --stage2-scenario $(STAGE2_SCENARIO) \
+	    --map-source scene-xml \
+	    --background rgb \
+	    --layout-json outputs/procthor/train_9/train_9_layout.json \
+	    --scene-graph outputs/procthor/train_9/scene_graph.json \
+	    --start-pose 2.0,4.0,0.0 \
+	    --goal-xy 9.0,4.0 \
+	    --birdview-downscale 6 \
+	    --astar-human-block-radius 0.65 \
+	    --stage2-mppi-horizon 32 \
+	    --stage2-replan-interval 0.0 \
+	    --stage2-costmap-interval 0.5 \
+	    --social-method $(SOCIAL) \
+	    --llm-model $(LLM_MODEL)
 
 ## kill: 杀掉残留的 mjpython 进程（viewer 报错 "already open" 时用）
 kill:

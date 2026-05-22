@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -130,6 +131,10 @@ def active_relationships(rel_events: list[RelEvent],
     return [(a, b, rtype) for (a, b), rtype in active.items()]
 
 
+def relationship_key(rels: list[tuple[str, str, str]]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted((str(a), str(b), str(rtype)) for a, b, rtype in rels))
+
+
 def conversation_groups(rels: list[tuple[str, str, str]]) -> list[list[str]]:
     adj: dict[str, set[str]] = {}
     for a, b, rtype in rels:
@@ -150,6 +155,45 @@ def conversation_groups(rels: list[tuple[str, str, str]]) -> list[list[str]]:
         if len(group) >= 2:
             groups.append(group)
     return groups
+
+
+def _refresh_param_geometry(params, agents: dict[str, Agent], groups: list[list[str]]) -> None:
+    """Move existing semantic params to current scripted agent/group positions.
+
+    LLM/API calls decide the semantic weights. Geometry still belongs to the
+    simulator, so when people move we update param centers/yaws without another
+    language call.
+    """
+    if not params:
+        return
+    agent_ids = list(agents.keys())
+    for p in params:
+        if p.entity_id in agents:
+            ag = agents[p.entity_id]
+            p.pos = (float(ag.pos[0]), float(ag.pos[1]))
+            p.yaw_deg = float(ag.heading_deg)
+            continue
+
+        if not str(p.entity_id).startswith("group_"):
+            continue
+        parts = str(p.entity_id).split("_")[1:]
+        idxs: list[int] = []
+        try:
+            idxs = [int(x) for x in parts if x.isdigit()]
+        except ValueError:
+            idxs = []
+        members: list[str] = []
+        if idxs and all(0 <= i < len(agent_ids) for i in idxs):
+            members = [agent_ids[i] for i in idxs]
+        elif groups:
+            members = groups[0]
+        member_agents = [agents[aid] for aid in members if aid in agents]
+        if len(member_agents) < 2:
+            continue
+        pts = np.array([a.pos for a in member_agents], dtype=np.float32)
+        p.pos = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+        a0, a1 = member_agents[0], member_agents[1]
+        p.yaw_deg = math.degrees(math.atan2(float(a1.pos[1] - a0.pos[1]), float(a1.pos[0] - a0.pos[0])))
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +219,13 @@ def build_costmap(agents: dict[str, Agent],
 
 def build_costmap_and_params(agents: dict[str, Agent],
                              groups: list[list[str]],
-                             shape: tuple[int, int]):
+                             shape: tuple[int, int],
+                             *,
+                             method: str = "rule",
+                             robot_pos: np.ndarray | tuple[float, float] | None = None,
+                             robot_goal: np.ndarray | tuple[float, float] | None = None,
+                             llm_model: str = "moonshot-v1-8k",
+                             verbose: bool = False):
     from experiments.social_nav.cost.llm_costmap import build_live_costmap
 
     return build_live_costmap(
@@ -183,8 +233,12 @@ def build_costmap_and_params(agents: dict[str, Agent],
         shape,
         x_range=(X_MIN, X_MAX),
         y_range=(Y_MIN, Y_MAX),
-        method="rule",
+        method=method,
         groups=groups,
+        robot_pos=robot_pos,
+        robot_goal=robot_goal,
+        llm_model=llm_model,
+        verbose=verbose,
     )
 
 
@@ -273,12 +327,20 @@ class SimWorld:
         duration:        float,
         dt:              float  = 0.1,
         social_weight:   float  = 8.0,
+        social_method:   str    = "rule",
+        llm_model:       str    = "moonshot-v1-8k",
+        async_social:    bool   = True,
+        verbose:         bool   = False,
     ) -> None:
         self._scripted  = {a.agent_id: a for a in scripted_agents}
         self._rel_events = sorted(rel_events, key=lambda e: e.t)
         self.duration   = duration
         self.dt         = dt
         self.social_w   = social_weight
+        self.social_method = social_method
+        self.llm_model = llm_model
+        self.async_social = async_social
+        self.verbose = verbose
 
         # 构造地图（纯矩形房间，只有墙）
         H = round((Y_MAX - Y_MIN) * PX_PER_M)
@@ -310,12 +372,28 @@ class SimWorld:
         self.agents: dict[str, Agent] = {}
         self.rels:   list[tuple[str,str,str]] = []
         self.groups: list[list[str]] = []
+        self._rel_key: tuple[tuple[str, str, str], ...] = tuple()
+        self._social_lock = threading.Lock()
+        self._social_worker: threading.Thread | None = None
+        self._pending_social: tuple[np.ndarray, list, str] | None = None
+        self.social_status = "initializing"
+        self.n_social_requests = 0
+        self.n_social_updates = 0
 
         # 初始 costmap + A*
         self._update_agents()
+        self._rel_key = relationship_key(self.rels)
         self.social_cm, self.social_params = build_costmap_and_params(
-            self.agents, self.groups, self.grid_free.shape
+            self.agents,
+            self.groups,
+            self.grid_free.shape,
+            method="rule" if self.social_method == "llm" else self.social_method,
+            robot_pos=self.robot_pos,
+            robot_goal=self.ROBOT_GOAL,
+            llm_model=self.llm_model,
+            verbose=self.verbose,
         )
+        self.social_status = "initial rule social field"
         self.waypoints = astar(self.grid_free, self.social_cm,
                                self.robot_pos, self.ROBOT_GOAL,
                                social_w=self.social_w)
@@ -357,6 +435,8 @@ class SimWorld:
         # 统计
         self.n_replans = 0
         self.robot_traj: list[np.ndarray] = [self.robot_pos.copy()]
+        if self.social_method == "llm":
+            self._request_social_update("initial_llm", blocking=not self.async_social)
 
     # ------------------------------------------------------------------
     def step(self) -> None:
@@ -367,25 +447,18 @@ class SimWorld:
 
         # 1. 所有 agent 同时推进（脚本插值）
         self._update_agents()
+        self._apply_pending_social_update()
 
-        # 2. 重算 social costmap
-        new_cm, new_params = build_costmap_and_params(
-            self.agents, self.groups, self.grid_free.shape
-        )
+        # 2. 人物位置每步更新给 MPPI hard constraint；语义 field 只在关系事件时刷新。
         self._ctrl.update_humans([tuple(a.pos) for a in self.agents.values()])
+        _refresh_param_geometry(self.social_params, self.agents, self.groups)
+        self._ctrl.update_social_params(self.social_params)
 
-        # 3. 如果 costmap 变化显著 → A* 重规划
-        diff = float(np.abs(new_cm - self._prev_cm).max())
-        if diff > 0.05:
-            self.social_cm = new_cm
-            self.social_params = new_params
-            self._ctrl.update_social_params(new_params)
-            self.waypoints = astar(self.grid_free, self.social_cm,
-                                   self.robot_pos, self.ROBOT_GOAL,
-                                   social_w=self.social_w)
-            self._wp_idx = 0
-            self._prev_cm = new_cm.copy()
-            self.n_replans += 1
+        # 3. 关系变化 → 请求 social update；rule 同步，LLM/API 异步。
+        rel_key = relationship_key(self.rels)
+        if rel_key != self._rel_key:
+            self._rel_key = rel_key
+            self._request_social_update("relationship_changed", blocking=False)
 
         # 4. 推进 waypoint 索引
         while self._wp_idx < len(self.waypoints) - 1:
@@ -420,6 +493,85 @@ class SimWorld:
                        for aid, sa in self._scripted.items()}
         self.rels   = active_relationships(self._rel_events, self.t)
         self.groups = conversation_groups(self.rels)
+
+    def _request_social_update(self, reason: str, *, blocking: bool) -> None:
+        self.n_social_requests += 1
+        if self.social_method == "rule" or blocking or not self.async_social:
+            cm, params = build_costmap_and_params(
+                self.agents,
+                self.groups,
+                self.grid_free.shape,
+                method=self.social_method,
+                robot_pos=self.robot_pos,
+                robot_goal=self.ROBOT_GOAL,
+                llm_model=self.llm_model,
+                verbose=self.verbose,
+            )
+            self._commit_social_update(cm, params, reason)
+            return
+
+        if self._social_worker is not None and self._social_worker.is_alive():
+            self.social_status = f"social update already running; skipped {reason}"
+            return
+
+        agents_snap = {aid: Agent(a.agent_id, a.pos.copy(), a.vel.copy(), a.heading_deg, a.activity, a.description)
+                       for aid, a in self.agents.items()}
+        groups_snap = [list(g) for g in self.groups]
+        robot_pos = self.robot_pos.copy()
+        robot_goal = self.ROBOT_GOAL.copy()
+        grid_shape = self.grid_free.shape
+        t_request = self.t
+        method = self.social_method
+        llm_model = self.llm_model
+        verbose = self.verbose
+        self.social_status = f"requesting {method} social update: {reason} t={t_request:.1f}s"
+
+        def _worker() -> None:
+            try:
+                cm, params = build_costmap_and_params(
+                    agents_snap,
+                    groups_snap,
+                    grid_shape,
+                    method=method,
+                    robot_pos=robot_pos,
+                    robot_goal=robot_goal,
+                    llm_model=llm_model,
+                    verbose=verbose,
+                )
+                with self._social_lock:
+                    self._pending_social = (cm, params, f"{reason}@{t_request:.1f}s")
+            except Exception as exc:
+                with self._social_lock:
+                    self.social_status = f"social update failed: {str(exc)[:80]}"
+
+        self._social_worker = threading.Thread(target=_worker, daemon=True)
+        self._social_worker.start()
+
+    def _apply_pending_social_update(self) -> None:
+        with self._social_lock:
+            pending = self._pending_social
+            self._pending_social = None
+        if pending is None:
+            return
+        cm, params, reason = pending
+        _refresh_param_geometry(params, self.agents, self.groups)
+        from experiments.social_nav.cost.llm_costmap import synthesize_costmap
+        cm = synthesize_costmap(params, self.grid_free.shape, x_range=(X_MIN, X_MAX), y_range=(Y_MIN, Y_MAX))
+        self._commit_social_update(cm, params, reason)
+
+    def _commit_social_update(self, cm: np.ndarray, params: list, reason: str) -> None:
+        self.social_cm = cm
+        self.social_params = params
+        if hasattr(self, "_ctrl"):
+            self._ctrl.update_social_params(params)
+        self.waypoints = astar(self.grid_free, self.social_cm,
+                               self.robot_pos, self.ROBOT_GOAL,
+                               social_w=self.social_w)
+        self._wp_idx = 0
+        self._prev_cm = cm.copy()
+        self.n_replans += 1
+        self.n_social_updates += 1
+        self.social_status = f"applied social update: {reason}"
 
 # ---------------------------------------------------------------------------
 # 预定义场景
