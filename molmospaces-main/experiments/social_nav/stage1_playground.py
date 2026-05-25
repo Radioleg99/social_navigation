@@ -48,7 +48,7 @@ from experiments.social_nav.cost.llm_costmap import (
     build_entity_params,
     get_default_prompt_templates,
 )
-from pipeline.scene_bridge import HumanInfo, SceneDescription, scene_graph_to_scene_description
+from pipeline.scene_bridge import HumanInfo, ObstacleInfo, SceneDescription, scene_graph_to_scene_description
 
 
 ACTIVITIES = {
@@ -526,6 +526,14 @@ def _synthesize_costmap_on_scene_grid(
         along = dx * fx + dy * fy
         perp = -dx * fy + dy * fx
         ps = ep.personal_space
+        if str(getattr(ep, "entity_id", "")).startswith("edge_"):
+            half_len = max(ps, 1e-3)
+            excess = np.maximum(np.abs(along) - half_len, 0.0)
+            sigma = ep.sigma_perp if ep.sigma_perp is not None else 0.25
+            cost = ep.score * np.exp(-(perp ** 2 + excess ** 2) / (2 * sigma ** 2))
+            field = np.maximum(field, cost.astype(np.float32))
+            continue
+
         sigma_along = np.where(along >= 0, ps * ep.orientation_sensitivity, ps * back_scale)
         sigma_side = ep.sigma_perp if ep.sigma_perp is not None else ps
         cost = ep.score * np.exp(
@@ -540,6 +548,53 @@ def _synthesize_costmap_on_scene_grid(
         field = np.clip(field + clearance_cost, 0.0, 1.0)
 
     return field
+
+
+def _synthesize_walking_costmap_on_scene_grid(
+    humans: list["Human"],
+    scene_map,
+    grid_shape: tuple[int, int],
+    downscale: int,
+    walking_yaws_deg: list[float] | None = None,
+) -> np.ndarray:
+    """Debug field for MPPI's single-walker local courtesy cost.
+
+    This is not a relation/social edge. It visualizes the soft local model used
+    by MPPI: passing in front of a walking person is costlier than passing
+    behind them.
+    """
+    H, W = grid_shape
+    rows, cols = np.indices((H, W), dtype=np.float32)
+    px = np.stack(
+        [(rows.reshape(-1) + 0.5) * downscale, (cols.reshape(-1) + 0.5) * downscale],
+        axis=-1,
+    )
+    world = scene_map.pos_px_to_m(px).reshape(H, W, -1)
+    GX = world[..., 0]
+    GY = world[..., 1]
+
+    field = np.zeros((H, W), dtype=np.float32)
+    for i, h in enumerate(humans):
+        if str(h.state).lower() != "walking":
+            continue
+        yaw_deg = (
+            float(walking_yaws_deg[i])
+            if walking_yaws_deg is not None and i < len(walking_yaws_deg)
+            else float(h.yaw_deg)
+        )
+        yaw_rad = math.radians(yaw_deg)
+        fx, fy = math.cos(yaw_rad), math.sin(yaw_rad)
+        dx = GX - float(h.pos[0])
+        dy = GY - float(h.pos[1])
+        along = dx * fx + dy * fy
+        perp = -dx * fy + dy * fx
+        sigma_along = np.where(along >= 0.0, 0.85, 0.25)
+        cost = np.exp(
+            -(along ** 2) / (2 * sigma_along ** 2)
+            -(perp ** 2) / (2 * 0.35 ** 2)
+        )
+        field = np.maximum(field, cost.astype(np.float32))
+    return np.clip(field, 0.0, 1.0)
 
 
 def _nearest_free_xy(scene_map: BirdviewSceneMap, grid_free: np.ndarray, xy: np.ndarray, downscale: int, max_search: int = 80) -> np.ndarray | None:
@@ -894,6 +949,7 @@ class Stage1Playground:
         self.start_xy = np.array([cfg.start_pose[0], cfg.start_pose[1]], dtype=np.float32)
         self.goal_xy = np.array(cfg.goal_xy, dtype=np.float32)
         self.humans: list[Human] = []
+        self.obstacles: list[ObstacleInfo] = []
         self.groups: list[tuple[int, int]] = []
         self.selected_human: int | None = None
         self.pending_relation: int | None = None
@@ -936,6 +992,7 @@ class Stage1Playground:
         self.stage2_tracks: list[ScriptedHumanTrack] = []
         self.stage2_rel_events: list[ScriptedRelationEvent] = []
         self.stage2_rel_key: tuple[tuple[int, int], ...] = tuple()
+        self.stage2_prev_human_positions: list[np.ndarray] = []
         self.stage2_robot_pos = self.start_xy.copy()
         self.stage2_robot_yaw = math.radians(float(cfg.start_pose[2]))
         self.stage2_robot_traj: list[np.ndarray] = [self.stage2_robot_pos.copy()]
@@ -945,6 +1002,8 @@ class Stage1Playground:
         self.stage2_last_replan_t = 0.0
         self.stage2_last_costmap_t = -1e9
         self.stage2_ctrl = None
+        self.stage2_mppi_info: dict | None = None
+        self.stage2_mppi_target: np.ndarray | None = None
         self.stage2_social_worker: threading.Thread | None = None
         self.stage2_pending_social: tuple[object, str] | None = None
         self.stage2_social_lock = threading.Lock()
@@ -1371,6 +1430,8 @@ class Stage1Playground:
         if invalidate_llm:
             self.social_params = None
             self.llm_dirty = True
+            if self.cfg.social_method == "llm":
+                self._start_llm_refresh()
         self.dirty = True
 
     # ── Stage2 scripted dynamic mode ────────────────────────────────────────
@@ -1401,12 +1462,15 @@ class Stage1Playground:
         self.stage2_rel_key = tuple()
         self.stage2_last_replan_t = 0.0
         self.stage2_last_costmap_t = -1e9
+        self.stage2_mppi_info = None
+        self.stage2_mppi_target = None
 
         start = self.stage2_reset_start_xy.astype(np.float32)
         goal = self.goal_xy.astype(np.float32)
         self.stage2_tracks, self.stage2_rel_events = self._stage2_make_scenario(start, goal)
         self.stage2_rel_events = sorted(self.stage2_rel_events, key=lambda ev: ev.t)
         self._stage2_sample_script()
+        self.stage2_prev_human_positions = [h.pos.copy() for h in self.humans]
         self._stage2_build_controller()
         self.stage2_rel_key = tuple(self.groups)
         self._mark_scene_changed(invalidate_llm=True)
@@ -1672,9 +1736,23 @@ class Stage1Playground:
         self.humans = [track.sample(self.stage2_t) for track in self.stage2_tracks]
         self.groups = self._stage2_active_groups()
 
+    def _stage2_walking_yaws_deg(self) -> list[float]:
+        if len(self.stage2_prev_human_positions) != len(self.humans):
+            return [float(h.yaw_deg) for h in self.humans]
+
+        yaws: list[float] = []
+        for prev, h in zip(self.stage2_prev_human_positions, self.humans):
+            delta = np.asarray(h.pos, dtype=np.float32) - np.asarray(prev, dtype=np.float32)
+            if str(h.state).lower() == "walking" and float(np.linalg.norm(delta)) > 0.01:
+                yaws.append(math.degrees(math.atan2(float(delta[1]), float(delta[0]))))
+            else:
+                yaws.append(float(h.yaw_deg))
+        return yaws
+
     def _stage2_build_controller(self) -> None:
         try:
             from experiments.social_nav.mppi_nav import MPPINav
+            walking_yaws = self._stage2_walking_yaws_deg()
 
             self.stage2_ctrl = MPPINav(
                 scene_map=self.scene_map,
@@ -1704,33 +1782,55 @@ class Stage1Playground:
                 social_params=self.social_params or [],
                 social_weight=max(12.0, self.cfg.astar_social_weight * 0.60),
                 human_positions=[tuple(h.pos) for h in self.humans],
+                human_yaws_deg=walking_yaws,
+                human_states=[str(h.state) for h in self.humans],
                 human_radius=max(0.30, float(self.cfg.astar_human_block_radius)),
                 seed=42,
             )
         except Exception as exc:
             self.stage2_ctrl = None
+            self.stage2_mppi_info = None
+            self.stage2_mppi_target = None
             self._log(f"Stage2 MPPI controller unavailable: {exc}")
+
+    def _get_node_pos(self, node_type: str, index: int) -> np.ndarray | None:
+        if node_type == "human" and 0 <= index < len(self.humans):
+            return self.humans[index].pos
+        if node_type == "object" and 0 <= index < len(self.obstacles):
+            return np.array(self.obstacles[index].pos, dtype=np.float32)
+        return None
 
     def _stage2_refresh_param_geometry(self) -> None:
         if not self.social_params:
             return
-        for i, h in enumerate(self.humans):
-            entity_id = f"person_{i}"
-            for p in self.social_params:
-                if getattr(p, "entity_id", "") == entity_id:
-                    p.pos = (float(h.pos[0]), float(h.pos[1]))
-                    p.yaw_deg = float(h.yaw_deg)
         for p in self.social_params:
             eid = str(getattr(p, "entity_id", ""))
-            if not eid.startswith("group_"):
+            if not eid.startswith("edge_"):
                 continue
-            parts = [int(x) for x in eid.split("_")[1:] if x.isdigit()]
-            if len(parts) < 2 or any(i >= len(self.humans) for i in parts[:2]):
+            # format: edge_{a_type}_{ia}_{b_type}_{ib}
+            parts = eid.split("_")  # ["edge","human","0","human","1"]
+            if len(parts) != 5:
                 continue
-            pts = np.array([self.humans[i].pos for i in parts[:2]], dtype=np.float32)
-            p.pos = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
-            d = self.humans[parts[1]].pos - self.humans[parts[0]].pos
+            a_type, b_type = parts[1], parts[3]
+            try:
+                ia, ib = int(parts[2]), int(parts[4])
+            except ValueError:
+                continue
+            pos_a = self._get_node_pos(a_type, ia)
+            pos_b = self._get_node_pos(b_type, ib)
+            if pos_a is None or pos_b is None:
+                continue
+            d = pos_b - pos_a
+            dist = float(np.linalg.norm(d))
+            p.pos = (float((pos_a[0] + pos_b[0]) / 2), float((pos_a[1] + pos_b[1]) / 2))
             p.yaw_deg = math.degrees(math.atan2(float(d[1]), float(d[0])))
+            p.personal_space = max(0.3, dist / 2.0)
+            p.sigma_perp = 0.25
+            p.orientation_sensitivity = 1.0
+            ref = getattr(p, "ref_dist", None)
+            if ref is not None and ref > 0.01:
+                base = getattr(p, "base_score", p.score)
+                p.score = float(np.clip(base * (dist / ref), 0.05, 1.0))
 
     def _stage2_request_social_update(self, reason: str) -> None:
         self.stage2_requests += 1
@@ -1879,8 +1979,11 @@ class Stage1Playground:
 
     def _stage2_step(self, dt: float) -> None:
         old_key = self.stage2_rel_key
+        prev_human_positions = [h.pos.copy() for h in self.humans]
         self.stage2_t += dt
         self._stage2_sample_script()
+        self.stage2_prev_human_positions = prev_human_positions
+        walking_yaws = self._stage2_walking_yaws_deg()
         new_key = tuple(self.groups)
         relation_changed = new_key != old_key
         if relation_changed:
@@ -1891,7 +1994,11 @@ class Stage1Playground:
         if self.stage2_ctrl is None:
             self._stage2_build_controller()
         if self.stage2_ctrl is not None:
-            self.stage2_ctrl.update_humans([tuple(h.pos) for h in self.humans])
+            self.stage2_ctrl.update_humans(
+                [tuple(h.pos) for h in self.humans],
+                walking_yaws,
+                [str(h.state) for h in self.humans],
+            )
             self.stage2_ctrl.update_social_params(self.social_params or [])
         self._stage2_refresh_dynamic_social_field(force=relation_changed or self.social_costmap is None)
 
@@ -1927,12 +2034,15 @@ class Stage1Playground:
         # MPPI's cost has no zero-velocity terminal constraint.
         near_final_leg = self.stage2_wp_idx >= len(self.path) - 2 or goal_dist < self.STAGE2_SLOW_RADIUS_M
         target = goal_xy if near_final_leg else self.path[min(self.stage2_wp_idx, len(self.path) - 1)]
+        self.stage2_mppi_target = np.asarray(target, dtype=np.float32).copy()
         if self.stage2_ctrl is not None:
             state = np.array([self.stage2_robot_pos[0], self.stage2_robot_pos[1], self.stage2_robot_yaw], dtype=np.float32)
-            v, w, _ = self.stage2_ctrl.step(state, target)
+            v, w, info = self.stage2_ctrl.step(state, target)
+            self.stage2_mppi_info = info
             if goal_dist < self.STAGE2_SLOW_RADIUS_M:
                 v = float(np.clip(v, -0.02, max(0.05, 0.45 * goal_dist)))
         else:
+            self.stage2_mppi_info = None
             d = target - self.stage2_robot_pos
             heading = math.atan2(float(d[1]), float(d[0]))
             err = math.atan2(math.sin(heading - self.stage2_robot_yaw), math.cos(heading - self.stage2_robot_yaw))
@@ -1948,13 +2058,42 @@ class Stage1Playground:
         self.stage2_robot_traj.append(self.stage2_robot_pos.copy())
 
     def _cycle_cost_view(self) -> None:
-        order = ["current", "delta", "off"]
+        order = ["current", "mppi", "delta", "off"]
         idx = order.index(self.cost_view) if self.cost_view in order else 0
         self.cost_view = order[(idx + 1) % len(order)]
         self.show_costmap = self.cost_view != "off"
         self._cost_overlay_cache_key = None
         self._cost_overlay_cache_surface = None
         self._log(f"cost view -> {self.cost_view}")
+
+    def _mppi_debug_costmap(self) -> np.ndarray | None:
+        if not self.stage2_enabled:
+            return None
+        field = np.zeros(self.grid_free_astar.shape, dtype=np.float32)
+        if self.social_params:
+            field = np.maximum(
+                field,
+                _synthesize_costmap_on_scene_grid(
+                    self.social_params,
+                    self.scene_map,
+                    self.grid_free_astar.shape,
+                    self.downscale,
+                    distance_transform=None,
+                    clearance_weight=0.0,
+                ),
+            )
+        if self.humans:
+            field = np.maximum(
+                field,
+                _synthesize_walking_costmap_on_scene_grid(
+                    self.humans,
+                    self.scene_map,
+                    self.grid_free_astar.shape,
+                    self.downscale,
+                    self._stage2_walking_yaws_deg(),
+                ),
+            )
+        return np.clip(field, 0.0, 1.0)
 
     def _log(self, message: str) -> None:
         for line in str(message).splitlines() or [""]:
@@ -1982,6 +2121,10 @@ class Stage1Playground:
         self.pending_relation = None
 
     def _recompute(self) -> None:
+        # If LLM is running, skip this recompute — wait for the result so A* runs
+        # once with fresh LLM params instead of twice (rule fallback + LLM params).
+        if self.llm_loading and self.cfg.social_method == "llm":
+            return
         if self.cfg.isolate_scene_component:
             self._scene_component_id = self._choose_scene_component()
         scene = self._scene_description()
@@ -2010,8 +2153,13 @@ class Stage1Playground:
                 clearance_weight=0.3,
             )
             if self.stage2_enabled and self.stage2_ctrl is not None:
+                walking_yaws = self._stage2_walking_yaws_deg()
                 self.stage2_ctrl.update_social_params(params)
-                self.stage2_ctrl.update_humans([tuple(h.pos) for h in self.humans])
+                self.stage2_ctrl.update_humans(
+                    [tuple(h.pos) for h in self.humans],
+                    walking_yaws,
+                    [str(h.state) for h in self.humans],
+                )
 
         try:
             grid = self._blocked_grid()
@@ -2265,7 +2413,7 @@ class Stage1Playground:
             )
             for h in self.humans
         ]
-        return SceneDescription(humans=humans, obstacles=[], groups=[list(g) for g in self.groups])
+        return SceneDescription(humans=humans, obstacles=self.obstacles, groups=[list(g) for g in self.groups])
 
     def _load_scene_graph(self, path: Path) -> None:
         scene = scene_graph_to_scene_description(path)
@@ -2277,6 +2425,7 @@ class Stage1Playground:
             )
             for h in scene.humans
         ]
+        self.obstacles = list(scene.obstacles)
         self.groups = [tuple(sorted((int(g[0]), int(g[1])))) for g in scene.groups if len(g) >= 2]
         self.dirty = True
 
@@ -2350,6 +2499,7 @@ class Stage1Playground:
         rect = self._map_rect()
         self._draw_map(rect)
         self._draw_path()
+        self._draw_stage2_mppi_debug()
         self._draw_stage2_robot()
         self._draw_humans()
         self._draw_start_goal()
@@ -2368,7 +2518,7 @@ class Stage1Playground:
         nav_overlay = self._get_scaled_nav_mask_overlay(rect)
         self.screen.blit(nav_overlay, rect)
 
-        if self.cost_view != "off" and self.social_costmap is not None:
+        if self.cost_view != "off":
             overlay = self._get_scaled_cost_overlay(rect)
             if overlay is not None:
                 self.screen.blit(overlay, rect)
@@ -2459,11 +2609,16 @@ class Stage1Playground:
         return self._floor_cache_surface
 
     def _get_scaled_cost_overlay(self, rect: pygame.Rect) -> pygame.Surface | None:
-        if self.social_costmap is None:
+        if self.cost_view == "mppi":
+            cm_src = self._mppi_debug_costmap()
+        else:
+            cm_src = self.social_costmap
+        if cm_src is None:
             return None
 
         key = (
             self._costmap_version,
+            pygame.time.get_ticks() if self.cost_view == "mppi" else 0,
             int(self._scene_component_id or 0),
             rect.width,
             rect.height,
@@ -2483,11 +2638,16 @@ class Stage1Playground:
             rgba[..., 2] = np.where(cm > 0, 45, np.where(cm < 0, 255, 0)).astype(np.uint8)
             rgba[..., 3] = np.clip(mag * 220, 0, 190).astype(np.uint8)
         else:
-            cm = np.clip(self.social_costmap, 0.0, 1.0)
+            cm = np.clip(cm_src, 0.0, 1.0)
             rgba = np.zeros((*cm.shape, 4), dtype=np.uint8)
-            rgba[..., 0] = 255
-            rgba[..., 1] = np.clip(235 - 175 * cm, 0, 255).astype(np.uint8)
-            rgba[..., 2] = np.clip(190 - 160 * cm, 0, 255).astype(np.uint8)
+            if self.cost_view == "mppi":
+                rgba[..., 0] = np.clip(70 + 185 * cm, 0, 255).astype(np.uint8)
+                rgba[..., 1] = np.clip(110 + 60 * (1.0 - cm), 0, 255).astype(np.uint8)
+                rgba[..., 2] = np.clip(255 - 205 * cm, 0, 255).astype(np.uint8)
+            else:
+                rgba[..., 0] = 255
+                rgba[..., 1] = np.clip(235 - 175 * cm, 0, 255).astype(np.uint8)
+                rgba[..., 2] = np.clip(190 - 160 * cm, 0, 255).astype(np.uint8)
             rgba[..., 3] = np.clip(cm * 150, 0, 150).astype(np.uint8)
 
         mask = self._navigable_display_mask()
@@ -2510,6 +2670,44 @@ class Stage1Playground:
         pygame.draw.lines(self.screen, (35, 110, 210), False, pts, 4)
         pygame.draw.lines(self.screen, (230, 245, 255), False, pts, 1)
 
+    def _draw_stage2_mppi_debug(self) -> None:
+        if not self.stage2_enabled or not self.stage2_mppi_info:
+            return
+        rollouts = self.stage2_mppi_info.get("rollout_xy")
+        costs = self.stage2_mppi_info.get("rollout_costs")
+        if rollouts is None or costs is None or len(rollouts) == 0:
+            return
+
+        costs_np = np.asarray(costs, dtype=np.float32)
+        order = np.argsort(costs_np)
+        draw_order = order[: min(28, len(order))]
+        c_min = float(np.min(costs_np[draw_order]))
+        c_max = float(np.max(costs_np[draw_order]))
+        denom = max(c_max - c_min, 1e-6)
+        for idx in draw_order[::-1]:
+            pts = [self._world_to_screen(p) for p in np.asarray(rollouts[idx], dtype=np.float32)]
+            if len(pts) < 2:
+                continue
+            q = float((costs_np[idx] - c_min) / denom)
+            color = (
+                int(80 + 140 * q),
+                int(210 - 95 * q),
+                int(245 - 120 * q),
+            )
+            pygame.draw.lines(self.screen, color, False, pts, 1)
+
+        best = int(order[0])
+        best_pts = [self._world_to_screen(p) for p in np.asarray(rollouts[best], dtype=np.float32)]
+        if len(best_pts) >= 2:
+            pygame.draw.lines(self.screen, (30, 245, 135), False, best_pts, 3)
+            pygame.draw.circle(self.screen, (30, 245, 135), best_pts[-1], 4)
+
+        if self.stage2_mppi_target is not None:
+            tp = self._world_to_screen(self.stage2_mppi_target)
+            pygame.draw.circle(self.screen, (255, 235, 65), tp, 6, 2)
+            pygame.draw.line(self.screen, (255, 235, 65), (tp[0] - 8, tp[1]), (tp[0] + 8, tp[1]), 1)
+            pygame.draw.line(self.screen, (255, 235, 65), (tp[0], tp[1] - 8), (tp[0], tp[1] + 8), 1)
+
     def _draw_stage2_robot(self) -> None:
         if not self.stage2_enabled:
             return
@@ -2531,35 +2729,42 @@ class Stage1Playground:
         pygame.draw.line(self.screen, (255, 255, 255), p, tip, 2)
         self._draw_text("R", (p[0] + 12, p[1] - 10), (255, 255, 255))
 
+    def _active_relation_humans(self) -> set[int]:
+        active = {idx for group in self.groups for idx in group}
+        for param in self.social_params or []:
+            parts = str(getattr(param, "entity_id", "")).split("_")
+            if len(parts) != 5 or parts[0] != "edge":
+                continue
+            if parts[1] == "human" and parts[2].isdigit():
+                active.add(int(parts[2]))
+            if parts[3] == "human" and parts[4].isdigit():
+                active.add(int(parts[4]))
+        return active
+
     def _draw_humans(self) -> None:
-        colors = {
-            "idle": (255, 160, 70),
-            "talking": (230, 110, 220),
-            "sitting": (150, 120, 230),
-            "walking": (60, 210, 230),
-            "watching": (95, 180, 255),
-            "arguing": (235, 65, 55),
-            "sleeping": (130, 150, 165),
-        }
+        active_relation = self._active_relation_humans()
         for a, b in self.groups:
             if a < len(self.humans) and b < len(self.humans):
                 pygame.draw.line(self.screen, (210, 60, 50), self._world_to_screen(self.humans[a].pos), self._world_to_screen(self.humans[b].pos), 2)
 
         for i, h in enumerate(self.humans):
             p = self._world_to_screen(h.pos)
-            col = colors.get(h.state, (220, 220, 220))
-            rect = self._map_rect()
-            grid_px = rect.width / max(self.grid_free_astar.shape[1], 1)
-            ps_m = max(0.30, float(self.cfg.astar_human_block_radius))
-            ps = max(12, int((ps_m / max(self.grid_spacing, 1e-6)) * grid_px))
-            pygame.draw.circle(self.screen, (*col, 35), p, ps, 1)
+            if i in active_relation:
+                col = (235, 65, 55)
+                label = f"P{i}:rel"
+            elif str(h.state).lower() == "walking":
+                col = (60, 210, 230)
+                label = f"P{i}:walk"
+            else:
+                col = (170, 174, 182)
+                label = f"P{i}:idle"
             pygame.draw.circle(self.screen, col, p, self.HUMAN_R_PX)
             if i == self.selected_human or i == self.pending_relation:
                 pygame.draw.circle(self.screen, (255, 255, 255), p, self.HUMAN_R_PX + 4, 2)
             yaw = math.radians(h.yaw_deg)
             tip = (int(p[0] + math.cos(yaw) * 24), int(p[1] - math.sin(yaw) * 24))
             pygame.draw.line(self.screen, (255, 255, 255), p, tip, 2)
-            self._draw_text(f"P{i}:{h.state}", (p[0] + 10, p[1] - 10), (255, 255, 255))
+            self._draw_text(label, (p[0] + 10, p[1] - 10), (255, 255, 255))
 
     def _draw_start_goal(self) -> None:
         s = self._world_to_screen(self.planned_start_xy)
@@ -2628,6 +2833,18 @@ class Stage1Playground:
                     ),
                     f"costmap dt: {self.cfg.stage2_costmap_interval:.1f}s",
                     f"robot: {self.stage2_robot_pos[0]:.2f}, {self.stage2_robot_pos[1]:.2f}",
+                    (
+                        "mppi best: none"
+                        if not self.stage2_mppi_info
+                        else f"mppi best:{float(self.stage2_mppi_info.get('best_cost', math.inf)):.1f} "
+                             f"clr:{float(self.stage2_mppi_info.get('best_clearance', 0.0)):.2f}m"
+                    ),
+                    (
+                        "mppi action: none"
+                        if not self.stage2_mppi_info
+                        else f"mppi action: v={float(self.stage2_mppi_info.get('action_v', 0.0)):.2f} "
+                             f"w={float(self.stage2_mppi_info.get('action_w_deg', 0.0)):.0f}deg/s"
+                    ),
                     f"social req/upd: {self.stage2_requests}/{self.stage2_updates}",
                 ]
                 if self.stage2_enabled
@@ -2655,7 +2872,7 @@ class Stage1Playground:
             "Space run/pause" if self.stage2_enabled else "Space cost view",
             "N next scenario" if self.stage2_enabled else "",
             "R reset script" if self.stage2_enabled else "R replan",
-            "V cost view" if self.stage2_enabled else "",
+            "V cost view: A*/MPPI" if self.stage2_enabled else "",
             "E export",
             "[ ] block radius",
             "F1 log  F2 L1  F3 L2",
@@ -2871,7 +3088,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--social-method", choices=["rule", "llm"], default="rule")
     p.add_argument("--llm-model", default="moonshot-v1-8k")
     p.add_argument("--astar-social-weight", type=float, default=30.0)
-    p.add_argument("--astar-human-block-radius", type=float, default=0.35)
+    p.add_argument("--astar-human-block-radius", type=float, default=0.0)
     p.add_argument("--astar-num-candidates", type=int, default=3)
     p.add_argument("--astar-diversity-penalty", type=float, default=8.0)
     p.add_argument("--astar-candidate-clearance-weight", type=float, default=8.0)
@@ -2911,20 +3128,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stage2-mppi-horizon",
         type=int,
-        default=32,
-        help="MPPI rollout horizon for Stage2 local control. With dt=0.1, 32 means 3.2s lookahead.",
+        default=64,
+        help="MPPI rollout horizon for Stage2 local control. With dt=0.1, 64 means 6.4s lookahead.",
     )
     p.add_argument(
         "--stage2-replan-interval",
         type=float,
-        default=0.0,
-        help="Seconds between low-rate A* replans in Stage2 while humans move. Set <=0 to replan only on relationship changes.",
+        default=0.5,
+        help="Seconds between low-rate A* replans in Stage2 while continuous social geometry moves. Set <=0 to replan only on relationship changes.",
     )
     p.add_argument(
         "--stage2-costmap-interval",
         type=float,
-        default=0.5,
-        help="Seconds between full-grid social costmap refreshes in Stage2. MPPI human updates still run every tick.",
+        default=0.1,
+        help="Seconds between full-grid social costmap refreshes in Stage2 (geometry is code-side, so this is cheap).",
     )
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=820)

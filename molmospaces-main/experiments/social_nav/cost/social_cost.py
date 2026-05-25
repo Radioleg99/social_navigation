@@ -64,6 +64,10 @@ class SocialCost:
             [p.sigma_perp if p.sigma_perp is not None else p.personal_space for p in params],
             dtype=self.dtype, device=self.device,
         )                                                                      # (M,)
+        is_edge = torch.tensor(
+            [str(p.entity_id).startswith("edge_") for p in params],
+            dtype=torch.bool, device=self.device,
+        )                                                                      # (M,)
 
         # Keep rear personal space non-trivial: otherwise A*/MPPI tends to cut
         # through the narrow gap directly behind a person instead of taking a
@@ -71,7 +75,9 @@ class SocialCost:
         self._tensors = dict(pos=pos, fx=fx, fy=fy, score=score,
                              sigma_front=ps * os_,
                              sigma_back=ps * self.back_scale,
-                             sigma_side=sigma_side)
+                             sigma_side=sigma_side,
+                             half_len=ps,
+                             is_edge=is_edge)
 
     def is_active(self) -> bool:
         return self._tensors is not None and self.weight > 0.0
@@ -102,6 +108,13 @@ class SocialCost:
             -(along ** 2) / (2 * sigma_along ** 2)
             -(perp  ** 2) / (2 * t["sigma_side"] ** 2)
         )                                                                      # (N, M)
+
+        if torch.any(t["is_edge"]):
+            excess = torch.clamp(torch.abs(along) - t["half_len"], min=0.0)
+            segment_gaussian = t["score"] * torch.exp(
+                -(perp ** 2 + excess ** 2) / (2 * t["sigma_side"] ** 2)
+            )
+            gaussian = torch.where(t["is_edge"].unsqueeze(0), segment_gaussian, gaussian)
 
         cost = gaussian.max(dim=-1).values                                     # (N,)
         return self.weight * cost

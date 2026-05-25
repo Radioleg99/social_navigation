@@ -14,6 +14,9 @@ GOAL    = -0.6,4.6
 SOCIAL  = rule
 LLM_MODEL = moonshot-v1-8k
 STAGE2_SCENARIO = conversation_crossing
+STAGE2_MPPI_HORIZON = 64
+STAGE2_REPLAN_DT = 0.5
+STAGE2_COSTMAP_DT = 0.1
 STEPS   = 200
 
 COMMON  = experiments/social_nav/run_pipeline.py \
@@ -63,7 +66,7 @@ playground:
 	    --start-pose 2.0,4.0,0.0 \
 	    --goal-xy 9.0,4.0 \
 	    --birdview-downscale 6 \
-	    --astar-human-block-radius 0.65 \
+	    --astar-human-block-radius 0.0 \
 	    --social-method $(SOCIAL)
 
 ## playground-stage2: 动态 Stage2 scripted playground（SCENARIO=conversation_crossing|argument_block|tv_watchers|sleeper_and_walker|queue_split）
@@ -79,10 +82,10 @@ playground-stage2:
 	    --start-pose 2.0,4.0,0.0 \
 	    --goal-xy 9.0,4.0 \
 	    --birdview-downscale 6 \
-	    --astar-human-block-radius 0.65 \
-	    --stage2-mppi-horizon 32 \
-	    --stage2-replan-interval 0.0 \
-	    --stage2-costmap-interval 0.5 \
+	    --astar-human-block-radius 0.0 \
+	    --stage2-mppi-horizon $(STAGE2_MPPI_HORIZON) \
+	    --stage2-replan-interval $(STAGE2_REPLAN_DT) \
+	    --stage2-costmap-interval $(STAGE2_COSTMAP_DT) \
 	    --social-method $(SOCIAL) \
 	    --llm-model $(LLM_MODEL)
 

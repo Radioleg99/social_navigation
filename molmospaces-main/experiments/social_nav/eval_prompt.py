@@ -16,14 +16,16 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from experiments.social_nav.cost.llm_costmap import (
     _SOCIAL_REGION_SYSTEM,
+    _SOCIAL_REGION_SYSTEM_FAST,
     _call_llm,
-    _parse_social_regions,
+    _parse_scored_scene,
     build_social_region_prompt,
 )
 
@@ -312,12 +314,12 @@ def _auto_layout(people: dict, groups: list[list[str]]) -> list[dict]:
     ]
 
 
-def _entity_rank(regions: list[dict], entity_id: str) -> int:
-    """Max priority rank for an entity across all social regions that target it."""
-    best = 0
-    for r in regions:
-        if entity_id in r.get("targets", []):
-            best = max(best, RANK.get(r.get("priority", ""), 0))
+def _entity_rank(edges: list[dict], entity_id: str) -> float:
+    """Max edge score involving this entity (0 if no edges)."""
+    best = 0.0
+    for e in edges:
+        if e["a"] == entity_id or e["b"] == entity_id:
+            best = max(best, e["score"])
     return best
 
 
@@ -325,7 +327,7 @@ def _entity_rank(regions: list[dict], entity_id: str) -> int:
 # Run one scenario
 # ---------------------------------------------------------------------------
 
-def run_scenario(scenario: dict, model: str) -> dict:
+def run_scenario(scenario: dict, model: str, fast: bool = False) -> dict:
     humans = _auto_layout(scenario["people"], scenario.get("groups", []))
     payload = {
         "humans": humans,
@@ -333,29 +335,32 @@ def run_scenario(scenario: dict, model: str) -> dict:
         "groups": scenario.get("groups", []),
         "robot": {"start": [0.0, 0.0], "goal": [8.0, 8.0]},
     }
-    prompt = build_social_region_prompt(payload, _SOCIAL_REGION_SYSTEM)
+    system = _SOCIAL_REGION_SYSTEM_FAST if fast else _SOCIAL_REGION_SYSTEM
+    prompt = build_social_region_prompt(payload, system)
 
+    t0 = time.perf_counter()
     try:
         resp = _call_llm(prompt, model)
-        reasoning, regions, _ = _parse_social_regions(resp)
+        elapsed = time.perf_counter() - t0
+        reasoning, edges = _parse_scored_scene(resp)
     except Exception as exc:
-        return {"passed": False, "error": str(exc), "failures": [], "regions": []}
+        elapsed = time.perf_counter() - t0
+        return {"passed": False, "error": str(exc), "failures": [], "edges": [], "elapsed": elapsed}
 
     failures = []
     for a, b in scenario.get("assert_gt", []):
-        ra = _entity_rank(regions, a)
-        rb = _entity_rank(regions, b)
+        ra = _entity_rank(edges, a)
+        rb = _entity_rank(edges, b)
         if ra <= rb:
-            na = RANK_NAME.get(ra, f"?({ra})")
-            nb = RANK_NAME.get(rb, f"?({rb})")
-            failures.append(f"{a}={na} should > {b}={nb}")
+            failures.append(f"{a}={ra:.2f} should > {b}={rb:.2f}")
 
     return {
         "passed": len(failures) == 0,
         "failures": failures,
         "error": None,
         "reasoning": reasoning,
-        "regions": regions,
+        "edges": edges,
+        "elapsed": elapsed,
     }
 
 
@@ -368,26 +373,34 @@ def main() -> None:
     parser.add_argument("--model", default="moonshot-v1-8k", help="LLM model name")
     parser.add_argument("--indices", default=None, help="Comma-separated scenario indices (default: all)")
     parser.add_argument("--verbose", action="store_true", help="Print LLM reasoning on failure")
+    parser.add_argument("--fast", action="store_true", help="Use compact prompt (faster, fewer tokens)")
     args = parser.parse_args()
 
     indices = list(range(len(SCENARIOS)))
     if args.indices:
         indices = [int(x.strip()) for x in args.indices.split(",")]
 
+    prompt_label = "FAST" if args.fast else "FULL"
+    print(f"Prompt: {prompt_label}  Model: {args.model}\n")
+
     passed = failed = errors = 0
+    latencies: list[float] = []
+
     for i in indices:
         s = SCENARIOS[i]
         print(f"\n[{i:02d}] {s['desc']}")
-        result = run_scenario(s, args.model)
+        result = run_scenario(s, args.model, fast=args.fast)
+        elapsed = result.get("elapsed", 0.0)
+        latencies.append(elapsed)
 
         if result["error"]:
-            print(f"  ERROR  {result['error']}")
+            print(f"  ERROR  {result['error']}  ({elapsed:.2f}s)")
             errors += 1
         elif result["passed"]:
-            print("  PASS")
+            print(f"  PASS  ({elapsed:.2f}s)")
             passed += 1
         else:
-            print("  FAIL")
+            print(f"  FAIL  ({elapsed:.2f}s)")
             for f in result["failures"]:
                 print(f"    ✗ {f}")
             if args.verbose:
@@ -395,8 +408,12 @@ def main() -> None:
             failed += 1
 
     total = passed + failed + errors
+    avg = sum(latencies) / len(latencies) if latencies else 0.0
+    p50 = sorted(latencies)[len(latencies) // 2] if latencies else 0.0
+    p95 = sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0.0
     print(f"\n{'='*50}")
     print(f"  {passed}/{total} passed   {failed} failed   {errors} errors")
+    print(f"  latency  avg={avg:.2f}s  p50={p50:.2f}s  p95={p95:.2f}s")
     print(f"{'='*50}\n")
 
 

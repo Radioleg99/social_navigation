@@ -41,6 +41,12 @@ class SceneCost:
         # --- hard constraints ---
         human_positions: list[tuple[float, float]] | None = None,
         human_radius: float = 0.30,          # physical body radius (m)
+        human_yaws_deg: list[float] | None = None,
+        human_states: list[str] | None = None,
+        walking_soft_weight: float = 8.0,
+        walking_front_sigma: float = 0.85,
+        walking_back_sigma: float = 0.25,
+        walking_side_sigma: float = 0.35,
         # --- soft weights ---
         goal_stage_weight: float       = 4.0,
         goal_terminal_weight: float    = 20.0,
@@ -62,6 +68,10 @@ class SceneCost:
         self.control_weight        = float(control_weight)
         self.smoothness_weight     = float(smoothness_weight)
         self.human_radius          = float(human_radius)
+        self.walking_soft_weight   = float(walking_soft_weight)
+        self.walking_front_sigma   = float(walking_front_sigma)
+        self.walking_back_sigma    = float(walking_back_sigma)
+        self.walking_side_sigma    = float(walking_side_sigma)
         self.device = torch.device(device)
         self.dtype  = dtype
 
@@ -80,6 +90,10 @@ class SceneCost:
             )  # (M, 2)
         else:
             self._human_pos_t = None
+        self._human_fx_t: torch.Tensor | None = None
+        self._human_fy_t: torch.Tensor | None = None
+        self._walking_mask_t: torch.Tensor | None = None
+        self._update_human_motion_tensors(human_yaws_deg, human_states)
 
         # Updated each command() call
         self._goal_xy_t     = torch.zeros(2, dtype=dtype, device=self.device)
@@ -91,7 +105,12 @@ class SceneCost:
     def set_prev_action(self, action: np.ndarray | torch.Tensor) -> None:
         self._prev_action_t = torch.as_tensor(action, dtype=self.dtype, device=self.device)
 
-    def update_humans(self, human_positions: list[tuple[float, float]]) -> None:
+    def update_humans(
+        self,
+        human_positions: list[tuple[float, float]],
+        human_yaws_deg: list[float] | None = None,
+        human_states: list[str] | None = None,
+    ) -> None:
         """Update human positions (call when humans move)."""
         if human_positions:
             self._human_pos_t = torch.tensor(
@@ -99,6 +118,7 @@ class SceneCost:
             )
         else:
             self._human_pos_t = None
+        self._update_human_motion_tensors(human_yaws_deg, human_states)
 
     # ------------------------------------------------------------------
     # MPPI cost interface
@@ -116,6 +136,7 @@ class SceneCost:
         if self._human_pos_t is not None:
             human_collision = self._human_collision(pos)
             cost = cost + _INF_COST * human_collision.to(self.dtype)
+            cost = cost + self._walking_directional_cost(pos)
 
         # --- Soft: clearance gradient (reward keeping distance from walls) ---
         clearance_violation = torch.clamp(self.clearance_threshold - clearance, min=0.0)
@@ -180,6 +201,66 @@ class SceneCost:
         diff = xy.unsqueeze(1) - self._human_pos_t.unsqueeze(0)   # (N, M, 2)
         dist = torch.linalg.norm(diff, dim=-1)                     # (N, M)
         return torch.any(dist < self.human_radius, dim=-1)         # (N,)
+
+    def _update_human_motion_tensors(
+        self,
+        human_yaws_deg: list[float] | None,
+        human_states: list[str] | None,
+    ) -> None:
+        if self._human_pos_t is None:
+            self._human_fx_t = None
+            self._human_fy_t = None
+            self._walking_mask_t = None
+            return
+
+        n = int(self._human_pos_t.shape[0])
+        yaws = list(human_yaws_deg or [0.0] * n)[:n]
+        if len(yaws) < n:
+            yaws.extend([0.0] * (n - len(yaws)))
+        yaw_t = torch.tensor(
+            [math.radians(float(y)) for y in yaws],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._human_fx_t = torch.cos(yaw_t)
+        self._human_fy_t = torch.sin(yaw_t)
+
+        states = list(human_states or ["idle"] * n)[:n]
+        if len(states) < n:
+            states.extend(["idle"] * (n - len(states)))
+        self._walking_mask_t = torch.tensor(
+            [str(s).lower() == "walking" for s in states],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+    def _walking_directional_cost(self, xy: torch.Tensor) -> torch.Tensor:
+        """Soft local cost for walking humans: front > rear, not a social relation."""
+        if (
+            self._human_pos_t is None
+            or self._human_fx_t is None
+            or self._human_fy_t is None
+            or self._walking_mask_t is None
+            or not torch.any(self._walking_mask_t)
+            or self.walking_soft_weight <= 0.0
+        ):
+            return torch.zeros(xy.shape[0], dtype=self.dtype, device=self.device)
+
+        diff = xy.unsqueeze(1) - self._human_pos_t.unsqueeze(0)
+        dx, dy = diff[..., 0], diff[..., 1]
+        along = dx * self._human_fx_t + dy * self._human_fy_t
+        perp = -dx * self._human_fy_t + dy * self._human_fx_t
+        sigma_along = torch.where(
+            along >= 0.0,
+            torch.tensor(self.walking_front_sigma, dtype=self.dtype, device=self.device),
+            torch.tensor(self.walking_back_sigma, dtype=self.dtype, device=self.device),
+        )
+        field = torch.exp(
+            -(along ** 2) / (2 * sigma_along ** 2)
+            -(perp ** 2) / (2 * self.walking_side_sigma ** 2)
+        )
+        field = torch.where(self._walking_mask_t.unsqueeze(0), field, torch.zeros_like(field))
+        return self.walking_soft_weight * field.max(dim=-1).values
 
     def clearance_of(self, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Numpy convenience wrapper for info/debug."""

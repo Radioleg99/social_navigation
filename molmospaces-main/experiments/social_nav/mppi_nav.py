@@ -68,6 +68,8 @@ class MPPINav:
         # ---------- Human hard constraint ----------
         human_positions: list[tuple[float, float]] | None = None,
         human_radius: float = 0.30,
+        human_yaws_deg: list[float] | None = None,
+        human_states: list[str] | None = None,
         seed: int = 0,
     ) -> None:
         cfg = MPPIConfig(
@@ -93,6 +95,8 @@ class MPPINav:
             downscale=downscale,
             human_positions=human_positions,
             human_radius=human_radius,
+            human_yaws_deg=human_yaws_deg,
+            human_states=human_states,
             goal_stage_weight=goal_stage_weight,
             goal_terminal_weight=goal_terminal_weight,
             heading_terminal_weight=heading_terminal_weight,
@@ -128,9 +132,14 @@ class MPPINav:
         """LLM 刷新后调用，热更新 social params，无需重建控制器。"""
         self._social_cost.update_params(params)
 
-    def update_humans(self, human_positions: list[tuple[float, float]]) -> None:
-        """人物位置变化时调用，更新 hard constraint。"""
-        self._scene_cost.update_humans(human_positions)
+    def update_humans(
+        self,
+        human_positions: list[tuple[float, float]],
+        human_yaws_deg: list[float] | None = None,
+        human_states: list[str] | None = None,
+    ) -> None:
+        """人物位置变化时调用，更新 physical collision 和 walking soft cost。"""
+        self._scene_cost.update_humans(human_positions, human_yaws_deg, human_states)
 
     def step(
         self,
